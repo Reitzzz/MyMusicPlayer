@@ -659,14 +659,17 @@ class MusicSchedulerApp(ctk.CTk):
         ctk.CTkLabel(err_win, text="可能被杀毒软件拦截\n请手动添加白名单", text_color="gray").pack()
         ctk.CTkButton(err_win, text="确定", width=80, command=err_win.destroy).pack(pady=20)
 
+    # --- 修复后的开机自启逻辑 ---
     def check_startup_status(self):
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
             try:
                 value, _ = winreg.QueryValueEx(key, "MusicSchedulerByStudent")
-                expected_cmd = f'"{sys.executable}" --silent'
-                if value == expected_cmd or value == sys.executable:
+                # 检查是否存在，不进行严格的字符串匹配，因为路径可能变
+                if value:
                     self.auto_start_var.set(True)
+                else:
+                    self.auto_start_var.set(False)
             except FileNotFoundError:
                 self.auto_start_var.set(False)
             winreg.CloseKey(key)
@@ -674,11 +677,11 @@ class MusicSchedulerApp(ctk.CTk):
             self.auto_start_var.set(False)
 
     def toggle_startup(self):
-        app_path = sys.executable 
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "MusicSchedulerByStudent"
         
         if not self.auto_start_var.get():
+            # 关闭自启
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
                 winreg.DeleteValue(key, app_name)
@@ -690,9 +693,21 @@ class MusicSchedulerApp(ctk.CTk):
                 self.status_label.configure(text=f"关闭自启失败: {e}", text_color="red")
             return
 
+        # 开启自启：区分是 .exe 还是 .py
         try:
+            cmd = ""
+            if getattr(sys, 'frozen', False):
+                # 打包后的 exe
+                app_path = sys.executable
+                cmd = f'"{app_path}" --silent'
+            else:
+                # 源码运行 .py
+                python_exe = sys.executable
+                script_path = os.path.abspath(sys.argv[0])
+                # 必须用 python 解释器调用脚本路径
+                cmd = f'"{python_exe}" "{script_path}" --silent'
+
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-            cmd = f'"{app_path}" --silent'
             winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
             self.status_label.configure(text="已开启开机自启", text_color="green")
@@ -757,7 +772,8 @@ class MusicSchedulerApp(ctk.CTk):
             "end_time": config['end_time'],
             "files": f_list, 
             "name": display_name,
-            "weekdays": weekdays_indices 
+            "weekdays": weekdays_indices,
+            "enabled": True  # 默认开启
         })
         self.save_tasks() # 保存
         self.refresh_task_list()
@@ -805,10 +821,21 @@ class MusicSchedulerApp(ctk.CTk):
         self.tasks[index]['files'] = f_list
         self.tasks[index]['weekdays'] = weekdays_indices
         self.tasks[index]['name'] = display_name
+        # 保持原有的启用/禁用状态，如果没有则默认为 True
+        self.tasks[index]['enabled'] = self.tasks[index].get('enabled', True)
         
         self.save_tasks() # 保存
         self.refresh_task_list()
         self.status_label.configure(text=f"任务修改成功: {display_name}", text_color="green")
+
+    # --- 任务启用/禁用逻辑 ---
+    def toggle_task_enabled(self, index, switch_var):
+        if 0 <= index < len(self.tasks):
+            new_state = bool(switch_var.get())
+            self.tasks[index]["enabled"] = new_state
+            self.save_tasks()
+            state_str = "启用" if new_state else "禁用"
+            self.status_label.configure(text=f"已{state_str}任务: {self.tasks[index]['name']}", text_color="#1F6AA5")
 
     def refresh_task_list(self):
         for widget in self.schedule_scroll.winfo_children():
@@ -839,16 +866,33 @@ class MusicSchedulerApp(ctk.CTk):
 
             info_text = f"{time_display} {mode_str}\n{task['name']} ({len(task.get('files',[]))}首) {days_str}"
             
+            # 任务信息
             lbl = ctk.CTkLabel(f, text=info_text, anchor="w", justify="left")
             lbl.pack(side="left", padx=10, pady=5)
             
+            # 右侧按钮区域
+            
+            # 1. 删除按钮
             del_btn = ctk.CTkButton(f, text="删除", width=50, fg_color="#CC0000", hover_color="#AA0000", text_color="white",
                                   command=lambda i=idx: self.delete_task(i))
             del_btn.pack(side="right", padx=5, pady=5)
             
+            # 2. 修改按钮
             edit_btn = ctk.CTkButton(f, text="修改", width=50, fg_color="#1F6AA5", hover_color="#144d7a",
                                    command=lambda i=idx: self.start_modify_task(i))
             edit_btn.pack(side="right", padx=5, pady=5)
+
+            # 3. 启用/禁用开关
+            is_enabled = task.get("enabled", True)
+            switch_var = ctk.IntVar(value=1 if is_enabled else 0)
+            
+            # 使用 functools.partial 或 lambda 来捕获当前的变量
+            cmd_toggle = lambda i=idx, v=switch_var: self.toggle_task_enabled(i, v)
+            
+            enable_switch = ctk.CTkSwitch(f, text="开启", variable=switch_var, command=cmd_toggle, 
+                                          width=60, onvalue=1, offvalue=0)
+            # 如果是禁用的，标签文字可以改为“关闭”或者保持“开启”看状态
+            enable_switch.pack(side="right", padx=(5, 10), pady=5)
         
         self.update_top_status()
 
@@ -901,9 +945,15 @@ class MusicSchedulerApp(ctk.CTk):
             self.next_task_label.configure(text=display_text, text_color="#1F6AA5")
         else:
             if self.tasks:
-                next_t = self.tasks[0]
-                display_text = f"下次: {next_t['time']} {next_t['name']}"
-                self.next_task_label.configure(text=display_text, text_color="gray")
+                # 找到下一个启用的任务
+                enabled_tasks = [t for t in self.tasks if t.get("enabled", True)]
+                if enabled_tasks:
+                    # 简单逻辑：显示列表第一个启用的（实际上应该按时间算，这里简化处理显示）
+                    next_t = enabled_tasks[0]
+                    display_text = f"下次: {next_t['time']} {next_t['name']}"
+                    self.next_task_label.configure(text=display_text, text_color="gray")
+                else:
+                    self.next_task_label.configure(text="下次播放: 全部暂停", text_color="gray")
             else:
                 self.next_task_label.configure(text="下次播放: 无任务", text_color="gray")
 
@@ -952,6 +1002,10 @@ class MusicSchedulerApp(ctk.CTk):
             
             # 1. 检查是否有任务需要开始
             for task in self.tasks:
+                # 检查任务是否启用
+                if not task.get("enabled", True):
+                    continue
+                
                 if task["time"] == current_time_str:
                     if current_weekday in task.get("weekdays", []):
                         self.start_playlist(task)
