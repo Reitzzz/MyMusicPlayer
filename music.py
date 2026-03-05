@@ -12,6 +12,33 @@ from datetime import datetime
 import pystray
 from PIL import Image, ImageDraw
 
+# ========================================================
+# 核心修复：强制设置工作目录为 exe 所在目录
+# ========================================================
+def resource_path(relative_path):
+    """ 获取资源的绝对路径，适配开发环境和打包后的 exe 环境 """
+    try:
+        # PyInstaller 创建临时文件夹，路径存储在 _MEIPASS 中
+        base_path = sys._MEIPASS
+    except Exception:
+        # 正常运行模式，使用当前脚本所在的目录
+        base_path = os.path.abspath(os.path.dirname(sys.argv[0]))
+        # 如果是 exe 运行，sys.argv[0] 就是 exe 的路径，dirname 就是 exe 所在文件夹
+    
+    return os.path.join(base_path, relative_path)
+
+# 获取当前程序（exe或py）所在的真实目录
+if getattr(sys, 'frozen', False):
+    # 如果是打包后的 exe
+    application_path = os.path.dirname(sys.executable)
+else:
+    # 如果是 python 脚本
+    application_path = os.path.dirname(os.path.abspath(__file__))
+
+# 强制将工作目录切换到程序所在目录
+os.chdir(application_path)
+# ========================================================
+
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 TASKS_FILE = "tasks.json"
@@ -251,7 +278,7 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
         self.destroy()
 
 # ========================================================
-# NEW: 弹窗类：步骤 0/3 设置时间和模式 (优化：动态隐藏结束时间)
+# NEW: 弹窗类：步骤 0/3 设置时间和模式
 # ========================================================
 class TimeModeDialog(ctk.CTkToplevel):
     def __init__(self, parent, callback, initial_data=None):
@@ -382,6 +409,7 @@ class MusicSchedulerApp(ctk.CTk):
         self.title("音乐定时播放系统 Pro")
         self.geometry("1000x750")
         
+        # 修复：获取参数前也需要确保工作目录，已在文件头处理
         if "--silent" in sys.argv:
             self.withdraw()
         else:
@@ -414,8 +442,10 @@ class MusicSchedulerApp(ctk.CTk):
         self.create_main_area()
         self.create_footer()
         self.check_startup_status()
-        self.load_music_files()
-        self.load_tasks() # 加载已保存的任务
+        
+        # 延时加载，确保UI先出来
+        self.after(100, self.load_music_files)
+        self.after(200, self.load_tasks) 
         
         self.setup_tray_icon()
         
@@ -424,7 +454,7 @@ class MusicSchedulerApp(ctk.CTk):
         self.timer_thread.daemon = True
         self.timer_thread.start()
 
-        self.after(200, self.check_first_run)
+        self.after(500, self.check_first_run)
 
     # --- 持久化存储 ---
     def save_tasks(self):
@@ -436,13 +466,18 @@ class MusicSchedulerApp(ctk.CTk):
             self.status_label.configure(text=f"保存失败: {e}", text_color="red")
 
     def load_tasks(self):
+        # 由于已经在开头强制切换了工作目录，这里直接读取文件名即可
         if os.path.exists(TASKS_FILE):
             try:
                 with open(TASKS_FILE, 'r', encoding='utf-8') as f:
                     self.tasks = json.load(f)
                 self.refresh_task_list()
+                self.status_label.configure(text=f"已加载 {len(self.tasks)} 个任务", text_color="gray")
             except Exception as e:
-                print(f"读取任务失败: {e}")
+                self.status_label.configure(text=f"读取任务失败: {e}", text_color="red")
+        else:
+            # 如果文件不存在，说明是新环境或没保存过
+            self.status_label.configure(text="无历史任务记录", text_color="gray")
 
     def show_error_alert(self, msg):
         err_win = ctk.CTkToplevel(self)
@@ -580,9 +615,10 @@ class MusicSchedulerApp(ctk.CTk):
         self.footer_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.status_label = ctk.CTkLabel(self.footer_frame, text="就绪", text_color="gray")
         self.status_label.pack(side="left", padx=20)
-        ctk.CTkLabel(self.footer_frame, text="v7.0 Pro", font=ctk.CTkFont(size=10)).pack(side="right", padx=20)
+        ctk.CTkLabel(self.footer_frame, text="v7.1 Pro", font=ctk.CTkFont(size=10)).pack(side="right", padx=20)
     
     def check_first_run(self):
+        # 强制切换工作目录后，直接读 config.json 即可
         config_file = "config.json"
         if not os.path.exists(config_file):
             self.show_help_window(forced_countdown=True)
@@ -659,13 +695,12 @@ class MusicSchedulerApp(ctk.CTk):
         ctk.CTkLabel(err_win, text="可能被杀毒软件拦截\n请手动添加白名单", text_color="gray").pack()
         ctk.CTkButton(err_win, text="确定", width=80, command=err_win.destroy).pack(pady=20)
 
-    # --- 修复后的开机自启逻辑 ---
+    # --- 开机自启逻辑 ---
     def check_startup_status(self):
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
             try:
                 value, _ = winreg.QueryValueEx(key, "MusicSchedulerByStudent")
-                # 检查是否存在，不进行严格的字符串匹配，因为路径可能变
                 if value:
                     self.auto_start_var.set(True)
                 else:
@@ -681,7 +716,6 @@ class MusicSchedulerApp(ctk.CTk):
         app_name = "MusicSchedulerByStudent"
         
         if not self.auto_start_var.get():
-            # 关闭自启
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
                 winreg.DeleteValue(key, app_name)
@@ -693,18 +727,14 @@ class MusicSchedulerApp(ctk.CTk):
                 self.status_label.configure(text=f"关闭自启失败: {e}", text_color="red")
             return
 
-        # 开启自启：区分是 .exe 还是 .py
         try:
             cmd = ""
             if getattr(sys, 'frozen', False):
-                # 打包后的 exe
                 app_path = sys.executable
                 cmd = f'"{app_path}" --silent'
             else:
-                # 源码运行 .py
                 python_exe = sys.executable
                 script_path = os.path.abspath(sys.argv[0])
-                # 必须用 python 解释器调用脚本路径
                 cmd = f'"{python_exe}" "{script_path}" --silent'
 
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
@@ -719,25 +749,35 @@ class MusicSchedulerApp(ctk.CTk):
 
     def load_music_files(self):
         self.music_files = []
+        # 由于已经在开头强制切换了工作目录，这里直接写相对路径即可
         directories = ["mp3", "changyong"]
+        
+        # 清空列表
         for widget in self.music_list_scroll.winfo_children():
             widget.destroy()
+            
         found_files = []
         allowed_extensions = ('.mp3', '.flac', '.wav', '.ogg', '.m4a', '.wma', '.aac')
         
         for folder in directories:
-            if not os.path.exists(folder):
-                try: os.makedirs(folder)
+            # os.path.abspath 会基于当前工作目录（即exe所在目录）生成路径
+            abs_folder = os.path.abspath(folder)
+            
+            if not os.path.exists(abs_folder):
+                try: os.makedirs(abs_folder)
                 except: continue
-            for file in os.listdir(folder):
+                
+            for file in os.listdir(abs_folder):
                 if file.lower().endswith(allowed_extensions):
-                    full_path = os.path.abspath(os.path.join(folder, file))
+                    full_path = os.path.join(abs_folder, file)
                     found_files.append(full_path)
+                    
                     row_frame = ctk.CTkFrame(self.music_list_scroll)
                     row_frame.pack(fill="x", padx=5, pady=2)
                     ctk.CTkLabel(row_frame, text=f"[{folder}] {file}").pack(side="left", padx=10)
                     ctk.CTkButton(row_frame, text="播放", width=50, height=24, 
                                 command=lambda p=full_path: self.play_single_file_manually(p)).pack(side="right", padx=5, pady=5)
+        
         self.music_files = found_files
         self.status_label.configure(text=f"刷新成功，找到 {len(found_files)} 个音频文件", text_color="green")
 
@@ -886,12 +926,10 @@ class MusicSchedulerApp(ctk.CTk):
             is_enabled = task.get("enabled", True)
             switch_var = ctk.IntVar(value=1 if is_enabled else 0)
             
-            # 使用 functools.partial 或 lambda 来捕获当前的变量
             cmd_toggle = lambda i=idx, v=switch_var: self.toggle_task_enabled(i, v)
             
             enable_switch = ctk.CTkSwitch(f, text="开启", variable=switch_var, command=cmd_toggle, 
                                           width=60, onvalue=1, offvalue=0)
-            # 如果是禁用的，标签文字可以改为“关闭”或者保持“开启”看状态
             enable_switch.pack(side="right", padx=(5, 10), pady=5)
         
         self.update_top_status()
@@ -948,7 +986,6 @@ class MusicSchedulerApp(ctk.CTk):
                 # 找到下一个启用的任务
                 enabled_tasks = [t for t in self.tasks if t.get("enabled", True)]
                 if enabled_tasks:
-                    # 简单逻辑：显示列表第一个启用的（实际上应该按时间算，这里简化处理显示）
                     next_t = enabled_tasks[0]
                     display_text = f"下次: {next_t['time']} {next_t['name']}"
                     self.next_task_label.configure(text=display_text, text_color="gray")
