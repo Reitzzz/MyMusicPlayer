@@ -1,7 +1,8 @@
-build/
+﻿build/
 dist/
 __pycache__/
 *.pyc
 *.spec
 *.toc
 *.pkg
+.idea/
