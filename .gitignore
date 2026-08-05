@@ -3,6 +3,7 @@ dist/
 __pycache__/
 *.pyc
 *.spec
+!music.spec
 *.toc
 *.pkg
 .idea/

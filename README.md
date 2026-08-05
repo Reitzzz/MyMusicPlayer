@@ -1,69 +1,126 @@
-音乐定时播放系统 Pro
-这是一个基于 Python 和 CustomTkinter 开发的本地定时音乐播放工具。该程序旨在帮助用户在指定的时间和日期自动播放特定的音乐列表，支持系统托盘后台运行及开机自启功能。
+# 音乐定时播放系统 Pro
 
-功能特点
-灵活的播放模式：
+一个面向 Windows 的本地定时音乐播放器。它可以按照指定时间和星期自动播放歌单，支持固定曲目、固定时长循环、系统托盘和开机自启动。
 
-固定曲目模式：顺序播放选定的音乐列表，播完即止。
+## 主要功能
 
-固定时长模式：在设定的时间段内循环播放音乐，到达结束时间后自动停止。
+- 按星期和精确时间创建播放任务。
+- 固定曲目模式：按顺序播放选中的歌曲，播放完毕后停止。
+- 固定时长模式：循环播放歌单，到达结束时间后自动停止。
+- 支持创建、修改、删除、启用和禁用任务。
+- 自动扫描程序目录下的 `mp3/` 和 `changyong/` 文件夹。
+- 支持 MP3、FLAC、WAV、OGG、M4A、WMA 和 AAC 文件。
+- 关闭主窗口后继续在系统托盘运行。
+- 支持 Windows 当前用户开机自启动和静默启动。
+- 使用 Windows Mutex 防止同一用户会话中重复运行。
+- 任务使用相对音乐路径，移动整个程序目录后仍可继续使用。
 
-精细化的任务管理：
+## 下载和使用 EXE
 
-支持自定义任务名称、开始时间及重复周期（指定星期）。
+1. 从 GitHub Releases 下载 ZIP 压缩包。
+2. 将 ZIP 完整解压到一个可写目录，不要直接在压缩包中运行。
+3. 运行 `music.exe`。
+4. 把音乐文件放入与 `music.exe` 同级的 `mp3/` 或 `changyong/` 文件夹。
+5. 返回程序并点击“刷新音乐列表”。
+6. 在“任务列表”中点击“+ 创建新任务”，按向导完成设置。
 
-支持随时修改、删除、启用或禁用已有任务。
+程序会在同级目录保存：
 
-本地音乐库管理：
+- `tasks.json`：定时任务和歌单配置。
+- `config.json`：首次运行等程序设置。
 
-自动扫描程序所在目录下的 mp3 或 changyong 文件夹。
+请不要只移动 `music.exe`。建议始终整体移动包含 EXE、配置和音乐目录的文件夹。
 
-支持多种主流音频格式，包括：.mp3, .flac, .wav, .ogg, .m4a, .wma, .aac。
+## 任务模式
 
-后台静默运行：
+### 固定曲目
 
-关闭窗口后可最小化至系统托盘继续运行。
+按照用户设置的歌曲顺序播放一次，全部播放完成后停止。
 
-支持通过 Windows 注册表设置开机自启（带 --silent 参数实现静默启动）。
+### 固定时长
 
-防重复启动：使用 Windows Mutex 机制，确保同一时间只有一个程序实例在运行。
+在开始时间到结束时间之间循环播放歌单，到达结束时间后停止。当前版本要求开始时间和结束时间处于同一天，不支持跨午夜时间段。
 
-项目结构
-music.py：程序的主入口文件，包含核心业务逻辑和 UI 构建。
+如果任务中的歌曲全部不存在或无法播放，程序会停止该任务并显示错误，不会无限重试。
 
-music.spec / MusicScheduler.spec：PyInstaller 打包配置文件，用于生成可执行文件 (EXE)。
+## 系统要求
 
-config.json：程序运行的基础配置文件（如记录首次运行状态）。
+运行打包后的 EXE：
 
-tasks.json：用户保存的定时播放任务数据。
+- Windows 10 或 Windows 11
+- 可用的音频输出设备
+- 无需另外安装 Python
 
-.gitignore：Git 忽略配置，排除了构建缓存和编译文件。
+从源码运行或打包：
 
-环境依赖
-在运行或打包之前，请确保已安装以下 Python 库：
+- Python 3.12
+- CustomTkinter
+- pygame
+- pystray
+- Pillow
+- PyInstaller（仅打包需要）
 
-Bash
-pip install customtkinter pygame pystray Pillow pyinstaller
-使用说明
-准备音乐文件：在程序主目录下新建 mp3 或 changyong 文件夹，并将您的音频文件放入其中。
+## 从源码运行
 
-启动程序：运行 music.py 或打包后的可执行文件。
+本仓库维护环境固定使用 `D:\Python\python.exe`：
 
-刷新列表：在软件左侧导航栏点击“刷新音乐列表”按钮，加载音频文件。
+```powershell
+D:\Python\python.exe -m pip install customtkinter pygame pystray Pillow pyinstaller
+D:\Python\python.exe music.py
+```
 
-创建任务：
+代码语法检查：
 
-在“任务列表”选项卡中点击“+ 创建新任务”。
+```powershell
+D:\Python\python.exe -m py_compile music.py
+```
 
-根据提示依次设置：时间与模式 -> 选择歌曲 -> 选择播放星期 -> 任务命名。
+## 打包 Windows EXE
 
-后台运行：点击窗口右上角的关闭按钮，程序将隐藏在系统托盘中。您可以随时通过点击托盘图标重新唤出界面。
+仓库中的 `music.spec` 是正式 PyInstaller 配置。请在项目根目录执行：
 
-打包为可执行文件 (EXE)
-项目中提供了完整的 .spec 配置文件，您可以在项目根目录下使用 PyInstaller 直接打包出无控制台窗口的独立运行程序。
+```powershell
+D:\Python\python.exe -m PyInstaller music.spec
+```
 
-使用以下命令进行打包：
+打包完成后：
 
-Bash
-pyinstaller MusicScheduler.spec
-打包完成后，可执行文件将生成在 dist 文件夹中。建议将该 EXE 文件移动到单独的目录，并在同级目录下创建相应的音乐文件夹以供使用。
+- 最终程序位于 `dist/music.exe`。
+- `build/` 是临时构建缓存，可以删除。
+- `dist/` 中的 EXE 是发布产物，不要在发布前删除。
+
+建议发布 ZIP 结构：
+
+```text
+MusicScheduler-Pro/
+├── music.exe
+├── mp3/
+└── changyong/
+```
+
+`config.json` 和 `tasks.json` 可以不放进首次发布包，程序会按需创建；如果希望提供空白文件，可分别使用 `{"first_run": false}` 和 `[]`。
+
+## 项目结构
+
+```text
+MusicPlayer/
+├── music.py        # 主程序、UI、调度与播放逻辑
+├── music.spec      # PyInstaller 打包配置
+├── config.json     # 本地程序配置
+├── tasks.json      # 本地任务数据
+├── mp3/            # 普通音乐目录
+├── changyong/      # 常用音乐目录
+├── AGENTS.md       # 自动化代理协作约定
+└── README.md
+```
+
+## 使用注意事项
+
+- 定时播放期间请关闭 Windows 自动睡眠，否则系统休眠时任务无法按时触发。
+- 首次启用开机自启动后，如果移动了程序目录，请在新位置重新勾选“开机自启”。程序会识别并提示失效的旧启动路径。
+- 删除或重命名任务中的音乐文件后，请刷新音乐列表并修改对应任务。
+- 主窗口右上角的关闭按钮只会隐藏窗口；需要彻底退出时，请使用托盘菜单中的“退出程序”。
+
+## 数据与隐私
+
+程序在本地运行，不会上传音乐、任务或配置。任务数据和设置保存在程序目录中，请在升级或迁移前备份 `tasks.json`。

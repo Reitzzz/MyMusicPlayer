@@ -1,14 +1,15 @@
 import customtkinter as ctk
 import os
 import sys
-import time
 import threading
+import queue
 import pygame
 import winreg
 import json
 import functools
 import ctypes
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
@@ -42,6 +43,38 @@ os.chdir(application_path)
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 TASKS_FILE = "tasks.json"
+APPLICATION_DIR = Path(application_path).resolve()
+MUSIC_DIRECTORIES = ("mp3", "changyong")
+
+
+def resolve_music_path(path_value):
+    """将任务中保存的相对路径或旧绝对路径解析到当前程序目录。"""
+    path = Path(path_value)
+
+    if not path.is_absolute():
+        return str((APPLICATION_DIR / path).resolve())
+
+    # 兼容移动程序目录前保存的绝对路径。
+    for index, part in enumerate(path.parts):
+        if part.lower() in MUSIC_DIRECTORIES:
+            current_candidate = APPLICATION_DIR.joinpath(*path.parts[index:]).resolve()
+            if current_candidate.exists() or not path.exists():
+                return str(current_candidate)
+
+    if path.exists():
+        return str(path.resolve())
+
+    return str(path)
+
+
+def make_portable_music_path(path_value):
+    """优先将音频路径保存为相对程序目录的便携路径。"""
+    resolved_path = Path(resolve_music_path(path_value))
+    try:
+        return resolved_path.relative_to(APPLICATION_DIR).as_posix()
+    except ValueError:
+        # 兼容未来可能由其他入口选择的程序目录外文件。
+        return str(resolved_path)
 
 # ========================================================
 # 1. 弹窗类：步骤 3/3 任务命名
@@ -182,8 +215,6 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
         self.scroll_playlist = ctk.CTkScrollableFrame(right_frame)
         self.scroll_playlist.pack(fill="both", expand=True, padx=5, pady=5)
         
-        self.update_playlist_ui()
-
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(side="bottom", pady=15, fill="x", padx=20)
         
@@ -192,6 +223,9 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(btn_frame, text="下一步", command=self.on_next, width=120, height=40, font=ctk.CTkFont(weight="bold")).pack(side="right", padx=10)
         ctk.CTkButton(btn_frame, text="取消", command=self.destroy, fg_color="transparent", border_width=1, text_color="gray", width=80).pack(side="right", padx=10)
+
+        # 依赖的状态标签创建完成后再绘制初始播放列表。
+        self.update_playlist_ui()
 
     def populate_library(self):
         for f_path in self.all_music_files:
@@ -435,6 +469,13 @@ class MusicSchedulerApp(ctk.CTk):
         self.current_task_name = "" 
         self.current_task_mode = "song" 
         self.current_task_end_time = "" 
+
+        # 主循环与跨线程事件状态
+        self.running = True
+        self._closing = False
+        self.last_trigger_date = None
+        self.triggered_tasks = set()
+        self.ui_event_queue = queue.Queue()
         
         self.auto_start_var = ctk.BooleanVar(value=False)
 
@@ -448,17 +489,21 @@ class MusicSchedulerApp(ctk.CTk):
         self.after(200, self.load_tasks) 
         
         self.setup_tray_icon()
-        
-        self.running = True
-        self.timer_thread = threading.Thread(target=self.check_schedule_loop)
-        self.timer_thread.daemon = True
-        self.timer_thread.start()
+
+        # 调度和 UI 事件都由 Tk 主线程处理。
+        self.after(50, self.process_ui_events)
+        self.after(500, self.check_schedule_tick)
 
         self.after(500, self.check_first_run)
 
     # --- 持久化存储 ---
     def save_tasks(self):
         try:
+            for task in self.tasks:
+                task["files"] = [
+                    make_portable_music_path(path)
+                    for path in task.get("files", [])
+                ]
             with open(TASKS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.tasks, f, ensure_ascii=False, indent=2)
             self.status_label.configure(text="设置已保存", text_color="green")
@@ -471,6 +516,11 @@ class MusicSchedulerApp(ctk.CTk):
             try:
                 with open(TASKS_FILE, 'r', encoding='utf-8') as f:
                     self.tasks = json.load(f)
+                for task in self.tasks:
+                    task["files"] = [
+                        make_portable_music_path(path)
+                        for path in task.get("files", [])
+                    ]
                 self.refresh_task_list()
                 self.status_label.configure(text=f"已加载 {len(self.tasks)} 个任务", text_color="gray")
             except Exception as e:
@@ -518,25 +568,50 @@ class MusicSchedulerApp(ctk.CTk):
         )
         icon_image = self.create_tray_image()
         self.tray_icon = pystray.Icon("MusicScheduler", icon_image, "定时播放器", menu)
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self.tray_thread.start()
 
     def show_window_from_tray(self, icon=None, item=None):
-        self.after(0, self.deiconify)
-        self.after(0, self.lift) 
+        self.ui_event_queue.put("show")
 
     def quit_app_from_tray(self, icon=None, item=None):
-        self.tray_icon.stop()
-        self.on_real_close()
+        self.ui_event_queue.put("quit")
+
+    def process_ui_events(self):
+        """在 Tk 主线程中处理来自托盘线程的窗口操作。"""
+        try:
+            while True:
+                action = self.ui_event_queue.get_nowait()
+                if action == "show":
+                    self.deiconify()
+                    self.lift()
+                elif action == "quit":
+                    self.on_real_close()
+                    return
+        except queue.Empty:
+            pass
+
+        if self.running:
+            self.after(50, self.process_ui_events)
 
     def on_close(self):
         self.withdraw()
 
     def on_real_close(self):
+        if self._closing:
+            return
+
+        self._closing = True
         self.running = False
-        try: pygame.mixer.quit()
-        except: pass
+        try:
+            self.tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
         self.destroy()
-        sys.exit()
 
     def create_sidebar(self):
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
@@ -607,6 +682,7 @@ class MusicSchedulerApp(ctk.CTk):
 
     def setup_music_tab(self):
         self.tab_music.grid_columnconfigure(0, weight=1)
+        self.tab_music.grid_rowconfigure(0, weight=1)
         self.music_list_scroll = ctk.CTkScrollableFrame(self.tab_music, label_text="发现的音频文件")
         self.music_list_scroll.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
 
@@ -696,20 +772,36 @@ class MusicSchedulerApp(ctk.CTk):
         ctk.CTkButton(err_win, text="确定", width=80, command=err_win.destroy).pack(pady=20)
 
     # --- 开机自启逻辑 ---
+    def get_startup_command(self):
+        """返回当前程序位置对应的开机启动命令。"""
+        if getattr(sys, 'frozen', False):
+            return f'"{sys.executable}" --silent'
+
+        python_exe = sys.executable
+        script_path = os.path.abspath(sys.argv[0])
+        return f'"{python_exe}" "{script_path}" --silent'
+
     def check_startup_status(self):
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "MusicSchedulerByStudent"
+        expected_command = self.get_startup_command()
+
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-            try:
-                value, _ = winreg.QueryValueEx(key, "MusicSchedulerByStudent")
-                if value:
-                    self.auto_start_var.set(True)
-                else:
-                    self.auto_start_var.set(False)
-            except FileNotFoundError:
-                self.auto_start_var.set(False)
-            winreg.CloseKey(key)
-        except Exception:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+                value, _ = winreg.QueryValueEx(key, app_name)
+            is_current = value.strip().casefold() == expected_command.strip().casefold()
+            self.auto_start_var.set(is_current)
+
+            if value and not is_current:
+                self.status_label.configure(
+                    text="检测到已失效的旧自启动路径，请重新开启",
+                    text_color="orange"
+                )
+        except FileNotFoundError:
             self.auto_start_var.set(False)
+        except Exception as e:
+            self.auto_start_var.set(False)
+            self.status_label.configure(text=f"读取自启动状态失败: {e}", text_color="red")
 
     def toggle_startup(self):
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -717,9 +809,8 @@ class MusicSchedulerApp(ctk.CTk):
         
         if not self.auto_start_var.get():
             try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-                winreg.DeleteValue(key, app_name)
-                winreg.CloseKey(key)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.DeleteValue(key, app_name)
                 self.status_label.configure(text="已关闭开机自启", text_color="gray")
             except FileNotFoundError:
                 pass
@@ -728,18 +819,9 @@ class MusicSchedulerApp(ctk.CTk):
             return
 
         try:
-            cmd = ""
-            if getattr(sys, 'frozen', False):
-                app_path = sys.executable
-                cmd = f'"{app_path}" --silent'
-            else:
-                python_exe = sys.executable
-                script_path = os.path.abspath(sys.argv[0])
-                cmd = f'"{python_exe}" "{script_path}" --silent'
-
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
-            winreg.CloseKey(key)
+            cmd = self.get_startup_command()
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
             self.status_label.configure(text="已开启开机自启", text_color="green")
                 
         except Exception as e:
@@ -750,7 +832,7 @@ class MusicSchedulerApp(ctk.CTk):
     def load_music_files(self):
         self.music_files = []
         # 由于已经在开头强制切换了工作目录，这里直接写相对路径即可
-        directories = ["mp3", "changyong"]
+        directories = MUSIC_DIRECTORIES
         
         # 清空列表
         for widget in self.music_list_scroll.winfo_children():
@@ -810,7 +892,7 @@ class MusicSchedulerApp(ctk.CTk):
             "time": config['time'], 
             "mode": config['mode'],
             "end_time": config['end_time'],
-            "files": f_list, 
+            "files": [make_portable_music_path(path) for path in f_list],
             "name": display_name,
             "weekdays": weekdays_indices,
             "enabled": True  # 默认开启
@@ -858,7 +940,7 @@ class MusicSchedulerApp(ctk.CTk):
         self.tasks[index]['time'] = config['time']
         self.tasks[index]['mode'] = config['mode']
         self.tasks[index]['end_time'] = config['end_time']
-        self.tasks[index]['files'] = f_list
+        self.tasks[index]['files'] = [make_portable_music_path(path) for path in f_list]
         self.tasks[index]['weekdays'] = weekdays_indices
         self.tasks[index]['name'] = display_name
         # 保持原有的启用/禁用状态，如果没有则默认为 True
@@ -942,7 +1024,7 @@ class MusicSchedulerApp(ctk.CTk):
             self.update_top_status()
 
     def start_playlist(self, task):
-        self.playlist_queue = task["files"]
+        self.playlist_queue = list(task.get("files", []))
         self.current_track_index = 0
         self.is_playlist_active = True
         self.current_task_name = task["name"]
@@ -952,29 +1034,70 @@ class MusicSchedulerApp(ctk.CTk):
         self.play_next_in_queue()
 
     def play_next_in_queue(self):
-        # 检查是否越界
-        if self.current_track_index >= len(self.playlist_queue):
-            # 列表播放结束
-            if self.current_task_mode == "duration":
-                # 模式二：循环播放
-                self.current_track_index = 0
-            else:
-                # 模式一：结束
-                self.stop_music()
-                self.status_label.configure(text="任务播放完毕", text_color="green")
+        total_files = len(self.playlist_queue)
+        if total_files == 0:
+            self.stop_music()
+            self.status_label.configure(text="任务停止：播放列表为空", text_color="red")
+            return
+
+        attempted = 0
+        last_error = ""
+
+        while attempted < total_files:
+            if self.current_track_index >= total_files:
+                if self.current_task_mode == "duration":
+                    self.current_track_index = 0
+                else:
+                    self.stop_music()
+                    self.status_label.configure(text="任务播放完毕", text_color="green")
+                    return
+
+            path = self.playlist_queue[self.current_track_index]
+            self.current_track_index += 1
+            attempted += 1
+
+            success, msg = self.play_music_file(path)
+            if success:
+                self.update_top_status()
+                self.status_label.configure(
+                    text=f"正在播放: {os.path.basename(path)}",
+                    text_color="#1F6AA5"
+                )
                 return
 
-        path = self.playlist_queue[self.current_track_index]
-        success, msg = self.play_music_file(path)
-        
-        if success:
-            self.current_track_index += 1
-            self.update_top_status()
-            self.status_label.configure(text=f"正在播放: {os.path.basename(path)}", text_color="#1F6AA5")
-        else:
-            # 播放失败跳过
-            self.current_track_index += 1
-            self.play_next_in_queue()
+            last_error = msg
+
+        self.stop_music()
+        error_suffix = f"（{last_error}）" if last_error else ""
+        self.status_label.configure(
+            text=f"任务停止：所有歌曲均无法播放{error_suffix}",
+            text_color="red"
+        )
+
+    def get_next_run(self, task, now):
+        """计算任务在未来 7 天内的下一次实际运行时间。"""
+        weekdays = {
+            day for day in task.get("weekdays", [])
+            if isinstance(day, int) and 0 <= day <= 6
+        }
+        if not weekdays:
+            return None
+
+        try:
+            task_time = datetime.strptime(task["time"], "%H:%M:%S").time()
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        for day_offset in range(8):
+            candidate_date = now.date() + timedelta(days=day_offset)
+            if candidate_date.weekday() not in weekdays:
+                continue
+
+            candidate = datetime.combine(candidate_date, task_time)
+            if candidate > now:
+                return candidate
+
+        return None
 
     def update_top_status(self):
         if self.is_playlist_active:
@@ -982,15 +1105,33 @@ class MusicSchedulerApp(ctk.CTk):
             display_text = f"{self.current_task_name} - {mode_desc}"
             self.next_task_label.configure(text=display_text, text_color="#1F6AA5")
         else:
-            if self.tasks:
-                # 找到下一个启用的任务
-                enabled_tasks = [t for t in self.tasks if t.get("enabled", True)]
-                if enabled_tasks:
-                    next_t = enabled_tasks[0]
-                    display_text = f"下次: {next_t['time']} {next_t['name']}"
-                    self.next_task_label.configure(text=display_text, text_color="gray")
+            now = datetime.now()
+            candidates = []
+            for task in self.tasks:
+                if not task.get("enabled", True):
+                    continue
+                next_run = self.get_next_run(task, now)
+                if next_run is not None:
+                    candidates.append((next_run, task))
+
+            if candidates:
+                next_run, next_task = min(candidates, key=lambda item: item[0])
+                day_offset = (next_run.date() - now.date()).days
+                if day_offset == 0:
+                    day_text = "今天"
+                elif day_offset == 1:
+                    day_text = "明天"
                 else:
-                    self.next_task_label.configure(text="下次播放: 全部暂停", text_color="gray")
+                    week_names = ["一", "二", "三", "四", "五", "六", "日"]
+                    day_text = f"周{week_names[next_run.weekday()]}"
+
+                display_text = (
+                    f"下次: {day_text} {next_run.strftime('%H:%M:%S')} "
+                    f"{next_task.get('name', '未命名任务')}"
+                )
+                self.next_task_label.configure(text=display_text, text_color="gray")
+            elif self.tasks:
+                self.next_task_label.configure(text="下次播放: 全部暂停或未设置日期", text_color="gray")
             else:
                 self.next_task_label.configure(text="下次播放: 无任务", text_color="gray")
 
@@ -1005,6 +1146,7 @@ class MusicSchedulerApp(ctk.CTk):
             self.show_error_alert(f"播放失败: {msg}")
 
     def play_music_file(self, path):
+        path = resolve_music_path(path)
         if not os.path.exists(path): return False, "文件不存在"
         try:
             if pygame.mixer.music.get_busy():
@@ -1018,50 +1160,64 @@ class MusicSchedulerApp(ctk.CTk):
             return False, str(e)
 
     def stop_music(self):
+        self.is_playlist_active = False
+        self.current_task_name = ""
         try:
-            self.is_playlist_active = False
-            self.current_task_name = ""
             pygame.mixer.music.stop()
             pygame.mixer.music.unload()
-            self.status_label.configure(text="播放已停止", text_color="gray")
-            self.update_top_status()
-        except:
+        except Exception:
             pass
 
-    def check_schedule_loop(self):
-        while self.running:
+        self.status_label.configure(text="播放已停止", text_color="gray")
+        self.update_top_status()
+
+    def check_schedule_tick(self):
+        if not self.running:
+            return
+
+        try:
             now = datetime.now()
             current_time_str = now.strftime("%H:%M:%S")
             current_weekday = now.weekday()
-            
-            try: self.time_label.configure(text=current_time_str)
-            except: pass
-            
+
+            if self.last_trigger_date != now.date():
+                self.last_trigger_date = now.date()
+                self.triggered_tasks.clear()
+
+            self.time_label.configure(text=current_time_str)
+
             # 1. 检查是否有任务需要开始
-            for task in self.tasks:
-                # 检查任务是否启用
+            for task in list(self.tasks):
                 if not task.get("enabled", True):
                     continue
-                
-                if task["time"] == current_time_str:
-                    if current_weekday in task.get("weekdays", []):
-                        self.start_playlist(task)
-                        time.sleep(1.1) 
-            
+
+                trigger_key = (id(task), task.get("time"))
+                should_start = (
+                    task.get("time") == current_time_str
+                    and current_weekday in task.get("weekdays", [])
+                    and trigger_key not in self.triggered_tasks
+                )
+                if should_start:
+                    self.triggered_tasks.add(trigger_key)
+                    self.start_playlist(task)
+
             # 2. 检查当前播放是否需要处理
             if self.is_playlist_active:
-                # 模式二：检查结束时间，强制停止
                 if self.current_task_mode == "duration" and self.current_task_end_time:
-                    # 简单字符串比较 (在同一天内有效)
                     if current_time_str >= self.current_task_end_time:
-                         self.stop_music()
-                         self.status_label.configure(text="已达到设定结束时间", text_color="orange")
+                        self.stop_music()
+                        self.status_label.configure(text="已达到设定结束时间", text_color="orange")
 
-                # 如果还在播放状态，且音乐停止了（一首歌播完），切下一首
                 if self.is_playlist_active and not pygame.mixer.music.get_busy():
                     self.play_next_in_queue()
-            
-            time.sleep(0.5)
+
+            if not self.is_playlist_active:
+                self.update_top_status()
+        except Exception as e:
+            self.status_label.configure(text=f"调度检查失败: {e}", text_color="red")
+        finally:
+            if self.running:
+                self.after(500, self.check_schedule_tick)
 
 if __name__ == "__main__":
     mutex_name = "Global_MusicScheduler_Instance_Lock"
