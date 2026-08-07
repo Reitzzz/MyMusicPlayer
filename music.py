@@ -8,6 +8,9 @@ import winreg
 import json
 import functools
 import ctypes
+import time
+import tkinter as tk
+from tkinter import font as tkfont
 from datetime import datetime, timedelta
 from pathlib import Path
 import pystray
@@ -76,40 +79,684 @@ def make_portable_music_path(path_value):
         # 兼容未来可能由其他入口选择的程序目录外文件。
         return str(resolved_path)
 
+
+class StableDpiScalingController:
+    """等待 Windows DPI 稳定后只执行一次 CustomTkinter 缩放重算。"""
+
+    POLL_INTERVAL_MS = 80
+    STABLE_DELAY_SECONDS = 0.25
+    _pending_changes = {}
+
+    @classmethod
+    def install(cls):
+        ctk.ScalingTracker.check_dpi_scaling = classmethod(cls._patched_check)
+
+    @staticmethod
+    def _patched_check(tracker):
+        StableDpiScalingController.check(tracker)
+
+    @classmethod
+    def check(cls, tracker):
+        now = time.monotonic()
+        windows = list(tracker.window_widgets_dict.keys())
+
+        for window in windows:
+            try:
+                if not window.winfo_exists() or window.state() in ("iconic", "withdrawn"):
+                    cls._pending_changes.pop(window, None)
+                    continue
+
+                detected_scaling = tracker.get_window_dpi_scaling(window)
+                applied_scaling = tracker.window_dpi_scaling_dict[window]
+                if detected_scaling == applied_scaling:
+                    cls._pending_changes.pop(window, None)
+                    continue
+
+                pending_change = cls._pending_changes.get(window)
+                if pending_change is None or pending_change[0] != detected_scaling:
+                    cls._pending_changes[window] = (detected_scaling, now)
+                    continue
+
+                if now - pending_change[1] < cls.STABLE_DELAY_SECONDS:
+                    continue
+
+                tracker.window_dpi_scaling_dict[window] = detected_scaling
+                window.block_update_dimensions_event()
+                try:
+                    tracker.update_scaling_callbacks_for_window(window)
+                except Exception as error:
+                    tracker.window_dpi_scaling_dict[window] = applied_scaling
+                    cls._pending_changes[window] = (detected_scaling, now)
+                    print(f"DPI 缩放更新失败: {error}")
+                else:
+                    cls._pending_changes.pop(window, None)
+                    window.event_generate("<<DpiScalingChanged>>", when="tail")
+                finally:
+                    window.unblock_update_dimensions_event()
+            except Exception:
+                cls._pending_changes.pop(window, None)
+
+        active_windows = set(windows)
+        for old_window in list(cls._pending_changes):
+            if old_window not in active_windows:
+                cls._pending_changes.pop(old_window, None)
+
+        for app in windows:
+            try:
+                if app.winfo_exists():
+                    app.after(cls.POLL_INTERVAL_MS, tracker.check_dpi_scaling)
+                    return
+            except Exception:
+                continue
+
+        tracker.update_loop_running = False
+
+    @classmethod
+    def forget_window(cls, window):
+        cls._pending_changes.pop(window, None)
+
+
+StableDpiScalingController.install()
+
+
+class DpiStableCTk(ctk.CTk):
+    """修正 CustomTkinter 5.2.2 在 DPI 更新期间未锁定尺寸事件的问题。"""
+
+    def block_update_dimensions_event(self):
+        self._block_update_dimensions_event = True
+
+    def destroy(self):
+        StableDpiScalingController.forget_window(self)
+        super().destroy()
+
+
+class DpiStableToplevel(ctk.CTkToplevel):
+    """为所有子窗口提供稳定的 Windows DPI 尺寸更新。"""
+
+    def block_update_dimensions_event(self):
+        self._block_update_dimensions_event = True
+
+    def destroy(self):
+        StableDpiScalingController.forget_window(self)
+        super().destroy()
+
+
+class TaskFlowWindow(DpiStableToplevel):
+    """不使用 grab 的单实例任务向导，并同步父子窗口的最小化状态。"""
+
+    def __init__(self, parent, defer_show=False):
+        super().__init__(parent)
+        self.parent_window = parent
+        self._destroying = False
+        self._group_minimized = False
+        self._initial_show_pending = defer_show
+        if defer_show:
+            self.withdraw()
+        self._parent_map_bind_id = parent.bind("<Map>", self._on_parent_map, add="+")
+        self._parent_unmap_bind_id = parent.bind("<Unmap>", self._on_parent_unmap, add="+")
+        self.bind("<Map>", self._on_window_map, add="+")
+        self.bind("<Unmap>", self._on_window_unmap, add="+")
+        self.bind("<<DpiScalingChanged>>", self._on_dpi_scaling_changed, add="+")
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.attributes("-topmost", True)
+        parent.active_task_dialog = self
+        if not defer_show:
+            self.after_idle(self.focus_task_window)
+
+    def show_when_ready(self, prepare_callback=None):
+        """完成隐藏状态下的首轮布局后，再一次性显示任务窗口。"""
+        if self._destroying or not self.winfo_exists():
+            return
+        if not self._initial_show_pending:
+            self.focus_task_window()
+            return
+
+        self.update_idletasks()
+        if prepare_callback is not None:
+            prepare_callback()
+        if self._destroying or not self.winfo_exists():
+            return
+
+        self._initial_show_pending = False
+        self.deiconify()
+        self.after_idle(self.focus_task_window)
+
+    def focus_task_window(self):
+        if self._destroying or self._initial_show_pending or not self.winfo_exists():
+            return
+        if self.parent_window.state() == "iconic":
+            self.parent_window.deiconify()
+        if self.state() == "iconic":
+            self.deiconify()
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+
+    def _on_window_unmap(self, event):
+        if event.widget is self and not self._destroying:
+            self.after_idle(self._sync_minimize_from_window)
+
+    def _sync_minimize_from_window(self):
+        if self._destroying or not self.winfo_exists() or self.state() != "iconic":
+            return
+        self._group_minimized = True
+        self.attributes("-topmost", False)
+        if self.parent_window.winfo_exists() and self.parent_window.state() != "iconic":
+            self.parent_window.iconify()
+
+    def _on_parent_unmap(self, event):
+        if event.widget is self.parent_window and not self._destroying:
+            self.after_idle(self._sync_minimize_from_parent)
+
+    def _sync_minimize_from_parent(self):
+        if self._destroying or not self.parent_window.winfo_exists():
+            return
+        if self.parent_window.state() != "iconic":
+            return
+        self._group_minimized = True
+        self.attributes("-topmost", False)
+        if self.winfo_exists() and self.state() != "iconic":
+            self.iconify()
+
+    def _on_window_map(self, event):
+        if event.widget is not self or not self._group_minimized or self._destroying:
+            return
+        if self.parent_window.winfo_exists() and self.parent_window.state() == "iconic":
+            self.parent_window.deiconify()
+
+    def _on_parent_map(self, event):
+        if event.widget is self.parent_window and self._group_minimized and not self._destroying:
+            self.after_idle(self._restore_window_group)
+
+    def _restore_window_group(self):
+        if self._destroying or not self.winfo_exists():
+            return
+        self.deiconify()
+        self._group_minimized = False
+        self.focus_task_window()
+
+    def _on_dpi_scaling_changed(self, _event=None):
+        pass
+
+    def destroy(self):
+        if self._destroying:
+            return
+        self._destroying = True
+
+        if getattr(self.parent_window, "active_task_dialog", None) is self:
+            self.parent_window.active_task_dialog = None
+        for sequence, bind_id in (
+            ("<Map>", self._parent_map_bind_id),
+            ("<Unmap>", self._parent_unmap_bind_id),
+        ):
+            try:
+                self.parent_window.unbind(sequence, bind_id)
+            except Exception:
+                pass
+        super().destroy()
+
+
+class SongRowCanvas(tk.Canvas):
+    """以单个 Canvas 绘制歌名和操作区，避免多层控件在缩放时反复重排。"""
+
+    INITIAL_DELAY_MS = 350
+    FRAME_INTERVAL_SECONDS = 1 / 60
+    SPEED_PIXELS_PER_SECOND = 45.0
+    TEXT_GAP = "     •     "
+
+    def __init__(
+        self,
+        master,
+        full_text,
+        text_font,
+        control_font,
+        background,
+        scale=1.0,
+        index_text=None,
+        actions=None,
+        layout_scheduler=None,
+    ):
+        self.full_text = full_text
+        self.text_font = text_font
+        self.control_font = control_font
+        self.background = background
+        self.index_text = index_text
+        self.actions = [dict(action) for action in (actions or []) if action]
+        self._layout_scheduler = layout_scheduler
+        self._scale = max(0.5, float(scale))
+        self._destroying = False
+        self._animation_job = None
+        self._text_hovered = False
+        self._hovered_action = None
+        self._cursor_name = ""
+        self._marquee_active = False
+        self._has_overflow = False
+        self._offset_pixels = 0.0
+        self._cycle_width = 0
+        self._last_frame_time = None
+        self._next_frame_time = None
+        self._text_left = 0
+        self._text_right = 0
+        self._action_hitboxes = {}
+        self._ellipsis_cache = {}
+        self._full_text_width = 0
+        self._prefix_widths = []
+        self._ellipsis_widths = {}
+        self._rebuild_measurements()
+
+        super().__init__(
+            master,
+            height=self._px(32),
+            background=self.background,
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+
+        self._text_item = self.create_text(
+            0,
+            0,
+            text="",
+            anchor="w",
+            fill="#202020",
+            font=self.text_font,
+        )
+        self._text_copy_item = self.create_text(
+            0,
+            0,
+            text="",
+            anchor="w",
+            fill="#202020",
+            font=self.text_font,
+            state="hidden",
+        )
+        self._left_mask_item = self.create_rectangle(
+            0, 0, 0, 0, fill=self.background, outline=self.background
+        )
+        self._right_mask_item = self.create_rectangle(
+            0, 0, 0, 0, fill=self.background, outline=self.background
+        )
+        self._index_item = None
+        if self.index_text is not None:
+            self._index_item = self.create_text(
+                0,
+                0,
+                text=self.index_text,
+                anchor="w",
+                fill="#858585",
+                font=self.text_font,
+            )
+
+        for action in self.actions:
+            action["shape_item"] = self.create_polygon(
+                0, 0, 1, 0, 1, 1, 0, 1,
+                smooth=True,
+                splinesteps=12,
+                fill=action["fill"],
+                outline="",
+            )
+            action["text_item"] = self.create_text(
+                0,
+                0,
+                text=action["text"],
+                fill=action["text_color"],
+                font=self.control_font,
+            )
+
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _px(self, logical_value):
+        return max(1, round(logical_value * self._scale))
+
+    def _on_configure(self, _event=None):
+        if not self._destroying and self._layout_scheduler is not None:
+            self._layout_scheduler(self)
+
+    @staticmethod
+    def _rounded_points(x1, y1, x2, y2, radius):
+        radius = min(radius, (x2 - x1) / 2, (y2 - y1) / 2)
+        return (
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1 + radius,
+            x1, y1,
+        )
+
+    def set_scale(self, scale):
+        self._scale = max(0.5, float(scale))
+        self.configure(height=self._px(32))
+        try:
+            self.pack_configure(pady=self._px(2))
+        except Exception:
+            pass
+        self._ellipsis_cache.clear()
+        self._rebuild_measurements()
+
+    def _rebuild_measurements(self):
+        """预先测量字符宽度，连续缩放时不再跨 Tcl 重复测量每个候选前缀。"""
+        cumulative_width = 0
+        self._prefix_widths = [0]
+        for character in self.full_text:
+            cumulative_width += self.text_font.measure(character)
+            self._prefix_widths.append(cumulative_width)
+        self._full_text_width = self.text_font.measure(self.full_text)
+        self._ellipsis_widths = {
+            "...": self.text_font.measure("..."),
+            "…": self.text_font.measure("…"),
+        }
+
+    def _refresh_layout(self):
+        if self._destroying or not self.winfo_exists():
+            return
+
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        center_y = height / 2
+        if self.index_text is None:
+            self._text_left = self._px(5)
+            control_width = self._px(40)
+        else:
+            self._text_left = self._px(36)
+            control_width = self._px(96)
+        self._text_right = max(self._text_left, width - control_width - self._px(3))
+
+        self.coords(self._left_mask_item, 0, 0, self._text_left, height)
+        self.coords(self._right_mask_item, self._text_right, 0, width, height)
+        if self._index_item is not None:
+            self.coords(self._index_item, self._px(5), center_y)
+
+        self._action_hitboxes.clear()
+        if self.index_text is None:
+            button_width = self._px(30)
+            button_height = self._px(24)
+            left = width - self._px(5) - button_width
+            action_positions = {0: left}
+        else:
+            button_width = self._px(25)
+            button_height = self._px(20)
+            gap = self._px(5)
+            left = width - self._px(5) - button_width * 3 - gap * 2
+            action_positions = {
+                0: left,
+                1: left + button_width + gap,
+                2: left + (button_width + gap) * 2,
+            }
+
+        top = (height - button_height) / 2
+        bottom = top + button_height
+        for action in self.actions:
+            action_left = action_positions[action["slot"]]
+            action_right = action_left + button_width
+            self._action_hitboxes[action["key"]] = (
+                action_left,
+                top,
+                action_right,
+                bottom,
+            )
+            self.coords(
+                action["shape_item"],
+                *self._rounded_points(
+                    action_left,
+                    top,
+                    action_right,
+                    bottom,
+                    self._px(6),
+                ),
+            )
+            self.coords(
+                action["text_item"],
+                (action_left + action_right) / 2,
+                center_y,
+            )
+
+        self._refresh_text()
+
+    def _fit_text(self, available_width):
+        available_width = max(0, int(available_width))
+        cached = self._ellipsis_cache.get(available_width)
+        if cached is not None:
+            return cached
+        if self._full_text_width <= available_width:
+            result = self.full_text
+        else:
+            suffix = "..."
+            if self._ellipsis_widths[suffix] > available_width:
+                suffix = "…"
+            suffix_width = self._ellipsis_widths[suffix]
+            if suffix_width > available_width:
+                result = ""
+            else:
+                low = 0
+                high = len(self._prefix_widths) - 1
+                prefix_limit = available_width - suffix_width
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if self._prefix_widths[middle] <= prefix_limit:
+                        low = middle
+                    else:
+                        high = middle - 1
+                result = self.full_text[:low] + suffix
+        self._ellipsis_cache[available_width] = result
+        return result
+
+    def _refresh_text(self):
+        available_width = max(0, self._text_right - self._text_left)
+        self._has_overflow = self._full_text_width > available_width
+        center_y = max(1, self.winfo_height()) / 2
+
+        if not self._has_overflow:
+            self._cancel_animation()
+            self.itemconfigure(self._text_item, text=self.full_text)
+            self.itemconfigure(self._text_copy_item, state="hidden")
+            self.coords(self._text_item, self._text_left, center_y)
+            return
+
+        if self._marquee_active:
+            cycle_text = self.full_text + self.TEXT_GAP
+            self._cycle_width = self.text_font.measure(cycle_text)
+            self.itemconfigure(self._text_item, text=cycle_text)
+            self.itemconfigure(self._text_copy_item, text=cycle_text, state="normal")
+            self._position_marquee_text(center_y)
+        else:
+            self.itemconfigure(self._text_item, text=self._fit_text(available_width))
+            self.itemconfigure(self._text_copy_item, state="hidden")
+            self.coords(self._text_item, self._text_left, center_y)
+
+    def _position_marquee_text(self, center_y=None):
+        if center_y is None:
+            center_y = max(1, self.winfo_height()) / 2
+        start_x = self._text_left - round(self._offset_pixels)
+        self.coords(self._text_item, start_x, center_y)
+        self.coords(self._text_copy_item, start_x + self._cycle_width, center_y)
+
+    def _set_text_hovered(self, hovered):
+        if self._text_hovered == hovered:
+            return
+        self._text_hovered = hovered
+        if hovered and self._has_overflow:
+            self._animation_job = self.after(self.INITIAL_DELAY_MS, self._start_animation)
+        elif not hovered:
+            self._cancel_animation()
+            self._refresh_text()
+
+    def _action_at(self, x, y):
+        for key, (x1, y1, x2, y2) in self._action_hitboxes.items():
+            if x1 <= x < x2 and y1 <= y < y2:
+                return key
+        return None
+
+    def _on_motion(self, event):
+        action_key = self._action_at(event.x, event.y)
+        if action_key != self._hovered_action:
+            self._hovered_action = action_key
+            for action in self.actions:
+                fill = action["hover_fill"] if action["key"] == action_key else action["fill"]
+                self.itemconfigure(action["shape_item"], fill=fill)
+
+        cursor_name = "hand2" if action_key is not None else ""
+        if cursor_name != self._cursor_name:
+            self._cursor_name = cursor_name
+            self.configure(cursor=cursor_name)
+
+        self._set_text_hovered(
+            self._text_left <= event.x < self._text_right and 0 <= event.y < self.winfo_height()
+        )
+
+    def _on_leave(self, _event=None):
+        self._set_text_hovered(False)
+        self._hovered_action = None
+        for action in self.actions:
+            self.itemconfigure(action["shape_item"], fill=action["fill"])
+        if self._cursor_name:
+            self._cursor_name = ""
+            self.configure(cursor="")
+
+    def _on_click(self, event):
+        action_key = self._action_at(event.x, event.y)
+        if action_key is None:
+            return
+        for action in self.actions:
+            if action["key"] == action_key:
+                action["command"]()
+                return
+
+    def _start_animation(self):
+        self._animation_job = None
+        if self._destroying or not self._text_hovered or not self._has_overflow:
+            return
+        self._marquee_active = True
+        self._offset_pixels = 0.0
+        self._last_frame_time = time.perf_counter()
+        self._next_frame_time = self._last_frame_time + self.FRAME_INTERVAL_SECONDS
+        self._refresh_text()
+        self._schedule_next_frame()
+
+    def _schedule_next_frame(self):
+        if self._next_frame_time is None:
+            return
+        delay_ms = max(1, round((self._next_frame_time - time.perf_counter()) * 1000))
+        self._animation_job = self.after(delay_ms, self._animate_frame)
+
+    def _animate_frame(self):
+        self._animation_job = None
+        if self._destroying or not self._text_hovered or not self._has_overflow:
+            self._cancel_animation()
+            return
+
+        now = time.perf_counter()
+        elapsed = min(now - self._last_frame_time, 0.05) if self._last_frame_time else 0
+        self._last_frame_time = now
+        if self._cycle_width > 0:
+            self._offset_pixels = (
+                self._offset_pixels + self.SPEED_PIXELS_PER_SECOND * elapsed
+            ) % self._cycle_width
+        self._position_marquee_text()
+
+        self._next_frame_time += self.FRAME_INTERVAL_SECONDS
+        if self._next_frame_time <= now:
+            missed_frames = int(
+                (now - self._next_frame_time) / self.FRAME_INTERVAL_SECONDS
+            ) + 1
+            self._next_frame_time += missed_frames * self.FRAME_INTERVAL_SECONDS
+        self._schedule_next_frame()
+
+    def _cancel_animation(self):
+        if self._animation_job is not None:
+            try:
+                self.after_cancel(self._animation_job)
+            except Exception:
+                pass
+            self._animation_job = None
+        self._marquee_active = False
+        self._offset_pixels = 0.0
+        self._last_frame_time = None
+        self._next_frame_time = None
+
+    def destroy(self):
+        if self._destroying:
+            return
+        self._destroying = True
+        self._cancel_animation()
+        super().destroy()
+
+
+def destroy_widget_tree(widget):
+    """逐层销毁动态控件，确保 CustomTkinter 注销每个 DPI 回调。"""
+    for child in widget.winfo_children():
+        destroy_widget_tree(child)
+    widget.destroy()
+
 # ========================================================
 # 1. 弹窗类：步骤 3/3 任务命名
 # ========================================================
-class TaskRenameDialog(ctk.CTkToplevel):
-    def __init__(self, parent, default_name, callback):
+class TaskRenameDialog(TaskFlowWindow):
+    def __init__(self, parent, default_name, callback, back_callback, initial_name=None):
         super().__init__(parent)
         self.callback = callback
+        self.back_callback = back_callback
         self.title("步骤 3/3: 任务命名")
         self.geometry("350x250")
+        self.minsize(350, 250)
         self.resizable(False, False)
-        self.attributes("-topmost", True)
-        self.grab_set() 
 
-        ctk.CTkLabel(self, text="为这个任务起个名字", font=ctk.CTkFont(size=18, weight="bold"), 
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, minsize=72)
+
+        content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        content_frame.grid(row=0, column=0, sticky="nsew")
+
+        ctk.CTkLabel(content_frame, text="为这个任务起个名字", font=ctk.CTkFont(size=18, weight="bold"),
                      text_color="#1F6AA5").pack(pady=(25, 15))
 
-        self.name_entry = ctk.CTkEntry(self, width=250, height=35, font=ctk.CTkFont(size=14))
-        clean_name = os.path.splitext(default_name)[0]
-        if len(clean_name) > 20: clean_name = clean_name[:20] + "..."
+        self.name_entry = ctk.CTkEntry(content_frame, width=250, height=35, font=ctk.CTkFont(size=14))
+        if initial_name is None:
+            clean_name = os.path.splitext(default_name)[0]
+            if len(clean_name) > 20:
+                clean_name = clean_name[:20] + "..."
+        else:
+            clean_name = initial_name
         self.name_entry.insert(0, clean_name)
         self.name_entry.pack(pady=10)
-        
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(side="bottom", pady=20)
+        btn_frame.grid(row=1, column=0, sticky="nsew", padx=40, pady=(6, 18))
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_rowconfigure(0, weight=1)
+
+        self.btn_back = ctk.CTkButton(
+            btn_frame,
+            text="上一步",
+            command=self.on_back,
+            width=110,
+            height=42,
+            corner_radius=21,
+            fg_color="transparent",
+            border_width=2,
+            text_color="#1F6AA5",
+            font=ctk.CTkFont(size=15, weight="bold")
+        )
+        self.btn_back.grid(row=0, column=0, sticky="w")
 
         self.btn_confirm = ctk.CTkButton(btn_frame, text="完成", command=self.on_confirm,
-                                       width=120, height=40, corner_radius=20, 
+                                       width=120, height=42, corner_radius=21,
                                        font=ctk.CTkFont(size=15, weight="bold"))
-        self.btn_confirm.pack(side="left", padx=10)
-
-        self.btn_cancel = ctk.CTkButton(btn_frame, text="取消", command=self.destroy,
-                                      width=80, height=40, corner_radius=20,
-                                      fg_color="transparent", border_width=2, text_color="gray")
-        self.btn_cancel.pack(side="left", padx=10)
+        self.btn_confirm.grid(row=0, column=2, sticky="e")
         
         self.name_entry.bind("<Return>", lambda event: self.on_confirm())
         self.name_entry.focus_set()
@@ -118,33 +765,47 @@ class TaskRenameDialog(ctk.CTkToplevel):
         new_name = self.name_entry.get().strip()
         if not new_name:
             new_name = "未命名任务"
-        self.callback(new_name)
+        callback = self.callback
         self.destroy()
+        callback(new_name)
+
+    def on_back(self):
+        draft_name = self.name_entry.get()
+        callback = self.back_callback
+        self.destroy()
+        callback(draft_name)
 
 # ========================================================
 # 2. 弹窗类：步骤 2/3 选择星期
 # ========================================================
-class WeekdaySelectionDialog(ctk.CTkToplevel):
-    def __init__(self, parent, time_str, song_count, callback, initial_selection=None):
+class WeekdaySelectionDialog(TaskFlowWindow):
+    def __init__(self, parent, time_str, song_count, callback, back_callback, initial_selection=None):
         super().__init__(parent)
         self.callback = callback
+        self.back_callback = back_callback
         self.title("步骤 2/3: 选择播放日期")
-        self.geometry("400x550") 
+        self.geometry("400x580")
+        self.minsize(400, 580)
         self.resizable(False, False)
-        self.attributes("-topmost", True) 
-        self.grab_set() 
-        
-        ctk.CTkLabel(self, text=f"任务时间: {time_str}", font=ctk.CTkFont(size=22, weight="bold"), text_color="#1F6AA5").pack(pady=(30, 5))
-        ctk.CTkLabel(self, text=f"包含歌曲数量: {song_count} 首", text_color="gray", font=ctk.CTkFont(size=12)).pack(pady=(0, 20))
-        
-        ctk.CTkFrame(self, height=2, fg_color="#E0E0E0").pack(fill="x", padx=30, pady=5)
-        
-        ctk.CTkLabel(self, text="请勾选需要播放的星期:", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=15)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, minsize=78)
+
+        content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        content_frame.grid(row=0, column=0, sticky="nsew")
+
+        ctk.CTkLabel(content_frame, text=f"任务时间: {time_str}", font=ctk.CTkFont(size=22, weight="bold"), text_color="#1F6AA5").pack(pady=(25, 5))
+        ctk.CTkLabel(content_frame, text=f"包含歌曲数量: {song_count} 首", text_color="gray", font=ctk.CTkFont(size=12)).pack(pady=(0, 14))
+
+        ctk.CTkFrame(content_frame, height=2, fg_color="#E0E0E0").pack(fill="x", padx=30, pady=5)
+
+        ctk.CTkLabel(content_frame, text="请勾选需要播放的星期:", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=12)
 
         self.checkboxes = []
         days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
         
-        self.check_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.check_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
         self.check_frame.pack(pady=5)
 
         for i, day in enumerate(days):
@@ -159,40 +820,80 @@ class WeekdaySelectionDialog(ctk.CTkToplevel):
             self.checkboxes.append(var)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(side="bottom", pady=30, fill="x", padx=40) 
-        
-        self.btn_confirm = ctk.CTkButton(btn_frame, text="下一步", command=self.on_confirm, 
-                                       height=45, corner_radius=22, 
-                                       font=ctk.CTkFont(size=16, weight="bold"),
-                                       fg_color="#1F6AA5", hover_color="#144d7a")
-        self.btn_confirm.pack(side="left", expand=True, fill="x", padx=(0, 10))
-        
-        self.btn_cancel = ctk.CTkButton(btn_frame, text="取消", command=self.destroy, 
-                                      height=45, corner_radius=22, width=80,
+        btn_frame.grid(row=1, column=0, sticky="nsew", padx=30, pady=(6, 18))
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_rowconfigure(0, weight=1)
+
+        self.btn_back = ctk.CTkButton(
+            btn_frame,
+            text="上一步",
+            command=self.on_back,
+            width=100,
+            height=44,
+            corner_radius=22,
+            fg_color="transparent",
+            border_width=2,
+            border_color="#1F6AA5",
+            text_color="#1F6AA5",
+            font=ctk.CTkFont(size=15, weight="bold")
+        )
+        self.btn_back.grid(row=0, column=0, sticky="w")
+
+        self.btn_cancel = ctk.CTkButton(btn_frame, text="取消", command=self.destroy,
+                                      height=44, corner_radius=22, width=78,
                                       fg_color="transparent", border_width=2, border_color="gray", text_color="gray",
                                       hover_color="#EEEEEE")
-        self.btn_cancel.pack(side="right", padx=(10, 0))
+        self.btn_cancel.grid(row=0, column=2, padx=(12, 10), sticky="e")
+
+        self.btn_confirm = ctk.CTkButton(btn_frame, text="下一步", command=self.on_confirm, 
+                                       width=110, height=44, corner_radius=22,
+                                       font=ctk.CTkFont(size=16, weight="bold"),
+                                       fg_color="#1F6AA5", hover_color="#144d7a")
+        self.btn_confirm.grid(row=0, column=3, sticky="e")
 
     def on_confirm(self):
         selected_indices = [i for i, var in enumerate(self.checkboxes) if var.get()]
-        self.callback(selected_indices)
+        callback = self.callback
         self.destroy()
+        callback(selected_indices)
+
+    def on_back(self):
+        selected_indices = [i for i, var in enumerate(self.checkboxes) if var.get()]
+        callback = self.back_callback
+        self.destroy()
+        callback(selected_indices)
 
 # ========================================================
 # 3. 弹窗类：步骤 1/3 选择歌曲
 # ========================================================
-class MultiSongSelectDialog(ctk.CTkToplevel):
-    def __init__(self, parent, all_music_files, callback, initial_selection=None):
-        super().__init__(parent)
-        self.all_music_files = all_music_files 
+class MultiSongSelectDialog(TaskFlowWindow):
+    def __init__(self, parent, all_music_files, callback, back_callback, initial_selection=None):
+        super().__init__(parent, defer_show=True)
+        self.all_music_files = all_music_files
         self.callback = callback
-        
+        self.back_callback = back_callback
         self.selected_files = list(initial_selection) if initial_selection else []
+        self.library_song_rows = []
+        self.playlist_song_rows = []
+        self._row_refresh_job = None
+        self._dirty_song_rows = set()
+        self._refresh_all_song_rows = False
+        self._canvas_scale = self._get_canvas_scale()
+        font_theme = ctk.ThemeManager.theme["CTkFont"]
+        font_size = max(1, round(font_theme["size"] * self._canvas_scale))
+        self.song_canvas_font = tkfont.Font(
+            family=font_theme["family"],
+            size=-font_size,
+            weight=font_theme["weight"],
+        )
+        self.control_canvas_font = tkfont.Font(
+            family=font_theme["family"],
+            size=-font_size,
+            weight="normal",
+        )
 
         self.title("步骤 1/3: 选择歌曲并排序")
         self.geometry("700x500")
-        self.attributes("-topmost", True)
-        self.grab_set()
 
         ctk.CTkLabel(self, text="请从左侧添加歌曲，在右侧调整播放顺序", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=10)
 
@@ -205,6 +906,9 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
         
         self.scroll_library = ctk.CTkScrollableFrame(left_frame)
         self.scroll_library.pack(fill="both", expand=True, padx=5, pady=5)
+        self.library_row_background = self._resolve_appearance_color(
+            self.scroll_library.cget("fg_color")
+        )
         
         self.populate_library()
 
@@ -214,34 +918,83 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
         
         self.scroll_playlist = ctk.CTkScrollableFrame(right_frame)
         self.scroll_playlist.pack(fill="both", expand=True, padx=5, pady=5)
+        self.playlist_row_background = self._resolve_appearance_color(
+            self.scroll_playlist.cget("fg_color")
+        )
         
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(side="bottom", pady=15, fill="x", padx=20)
         
-        self.status_lbl = ctk.CTkLabel(btn_frame, text="已选: 0 首", text_color="gray")
-        self.status_lbl.pack(side="left", padx=10)
+        self.btn_back = ctk.CTkButton(
+            btn_frame,
+            text="上一步",
+            command=self.on_back,
+            width=100,
+            height=40,
+            corner_radius=20,
+            fg_color="transparent",
+            border_width=2,
+            border_color="#1F6AA5",
+            text_color="#1F6AA5",
+            font=ctk.CTkFont(weight="bold")
+        )
+        self.btn_back.pack(side="left", padx=(10, 6))
 
-        ctk.CTkButton(btn_frame, text="下一步", command=self.on_next, width=120, height=40, font=ctk.CTkFont(weight="bold")).pack(side="right", padx=10)
-        ctk.CTkButton(btn_frame, text="取消", command=self.destroy, fg_color="transparent", border_width=1, text_color="gray", width=80).pack(side="right", padx=10)
+        self.status_lbl = ctk.CTkLabel(btn_frame, text="已选: 0 首", text_color="gray")
+        self.status_lbl.pack(side="left", padx=(4, 10))
+
+        self.btn_next = ctk.CTkButton(btn_frame, text="下一步", command=self.on_next, width=120, height=40, font=ctk.CTkFont(weight="bold"))
+        self.btn_next.pack(side="right", padx=10)
+        self.btn_cancel = ctk.CTkButton(btn_frame, text="取消", command=self.destroy, fg_color="transparent", border_width=1, text_color="gray", width=80, height=40)
+        self.btn_cancel.pack(side="right", padx=10)
 
         # 依赖的状态标签创建完成后再绘制初始播放列表。
         self.update_playlist_ui()
+        self.after_idle(self._finish_initial_show)
+
+    @staticmethod
+    def _resolve_appearance_color(color_value):
+        if isinstance(color_value, (tuple, list)):
+            return color_value[ctk.AppearanceModeTracker.get_mode()]
+        if color_value == "transparent":
+            return "gray81"
+        return color_value
+
+    def _get_canvas_scale(self):
+        try:
+            return ctk.ScalingTracker.get_widget_scaling(self)
+        except Exception:
+            return 1.0
+
+    def _finish_initial_show(self):
+        if self._destroying or not self.winfo_exists():
+            return
+        self.show_when_ready(self._refresh_song_rows)
 
     def populate_library(self):
         for f_path in self.all_music_files:
             try:
-                row = ctk.CTkFrame(self.scroll_library, fg_color="transparent")
-                row.pack(fill="x", pady=2)
-                
-                name = os.path.basename(f_path)
-                display_name = name if len(name) < 25 else name[:22] + "..."
-                
-                ctk.CTkLabel(row, text=display_name, anchor="w").pack(side="left", padx=5)
-                
                 add_cmd = functools.partial(self.add_song, f_path)
-                
-                ctk.CTkButton(row, text="+", width=30, height=24, 
-                              command=add_cmd).pack(side="right", padx=5)
+                row = SongRowCanvas(
+                    self.scroll_library,
+                    full_text=os.path.basename(f_path),
+                    text_font=self.song_canvas_font,
+                    control_font=self.control_canvas_font,
+                    background=self.library_row_background,
+                    scale=self._canvas_scale,
+                    layout_scheduler=self._schedule_row_refresh,
+                    actions=[{
+                        "key": "add",
+                        "slot": 0,
+                        "text": "+",
+                        "fill": "#3B8ED0",
+                        "hover_fill": "#36719F",
+                        "text_color": "#FFFFFF",
+                        "command": add_cmd,
+                    }],
+                )
+                row.pack(fill="x", pady=max(1, round(2 * self._canvas_scale)))
+                self.library_song_rows.append(row)
             except Exception:
                 pass
 
@@ -269,58 +1022,150 @@ class MultiSongSelectDialog(ctk.CTkToplevel):
 
     def update_playlist_ui(self):
         try:
-            for widget in self.scroll_playlist.winfo_children():
-                widget.destroy()
+            for row in self.playlist_song_rows:
+                row.destroy()
+            self.playlist_song_rows.clear()
             
             self.status_lbl.configure(text=f"已选: {len(self.selected_files)} 首")
 
             for idx, f_path in enumerate(self.selected_files):
-                row = ctk.CTkFrame(self.scroll_playlist)
-                row.pack(fill="x", pady=2, padx=2)
-                
-                ctk.CTkLabel(row, text=f"{idx+1}.", width=20, text_color="gray").pack(side="left", padx=(5,0))
-                
-                name = os.path.basename(f_path)
-                display_name = name if len(name) < 18 else name[:15] + "..."
-                ctk.CTkLabel(row, text=display_name, anchor="w").pack(side="left", padx=5, expand=True, fill="x")
-
+                actions = []
                 if idx > 0:
-                    cmd_up = functools.partial(self.move_up, idx)
-                    ctk.CTkButton(row, text="↑", width=25, height=20, fg_color="#DDDDDD", text_color="black", hover_color="#BBBBBB",
-                                  command=cmd_up).pack(side="left", padx=2)
-                else:
-                    ctk.CTkLabel(row, text="", width=29).pack(side="left")
-
+                    actions.append({
+                        "key": "up",
+                        "slot": 0,
+                        "text": "↑",
+                        "fill": "#DDDDDD",
+                        "hover_fill": "#BBBBBB",
+                        "text_color": "#202020",
+                        "command": functools.partial(self.move_up, idx),
+                    })
                 if idx < len(self.selected_files) - 1:
-                    cmd_down = functools.partial(self.move_down, idx)
-                    ctk.CTkButton(row, text="↓", width=25, height=20, fg_color="#DDDDDD", text_color="black", hover_color="#BBBBBB",
-                                  command=cmd_down).pack(side="left", padx=2)
-                else:
-                    ctk.CTkLabel(row, text="", width=29).pack(side="left")
+                    actions.append({
+                        "key": "down",
+                        "slot": 1,
+                        "text": "↓",
+                        "fill": "#DDDDDD",
+                        "hover_fill": "#BBBBBB",
+                        "text_color": "#202020",
+                        "command": functools.partial(self.move_down, idx),
+                    })
+                actions.append({
+                    "key": "delete",
+                    "slot": 2,
+                    "text": "✕",
+                    "fill": self.playlist_row_background,
+                    "hover_fill": "#FFEEEE",
+                    "text_color": "#D92323",
+                    "command": functools.partial(self.remove_song, idx),
+                })
 
-                cmd_del = functools.partial(self.remove_song, idx)
-                ctk.CTkButton(row, text="✕", width=25, height=20, fg_color="transparent", text_color="red", hover_color="#FFEEEE",
-                              command=cmd_del).pack(side="left", padx=(5, 5))
-                              
+                row = SongRowCanvas(
+                    self.scroll_playlist,
+                    full_text=os.path.basename(f_path),
+                    text_font=self.song_canvas_font,
+                    control_font=self.control_canvas_font,
+                    background=self.playlist_row_background,
+                    scale=self._canvas_scale,
+                    index_text=f"{idx + 1}.",
+                    actions=actions,
+                    layout_scheduler=self._schedule_row_refresh,
+                )
+                row.pack(
+                    fill="x",
+                    padx=max(1, round(2 * self._canvas_scale)),
+                    pady=max(1, round(2 * self._canvas_scale)),
+                )
+                self.playlist_song_rows.append(row)
+
+            self._schedule_row_refresh()
         except Exception:
             pass
+
+    def _schedule_row_refresh(self, row=None):
+        if self._destroying:
+            return
+        if row is None:
+            self._refresh_all_song_rows = True
+            self._dirty_song_rows.clear()
+        elif not self._refresh_all_song_rows:
+            self._dirty_song_rows.add(row)
+        if self._row_refresh_job is None:
+            self._row_refresh_job = self.after_idle(self._refresh_song_rows)
+
+    def _refresh_song_rows(self):
+        self._row_refresh_job = None
+        if self._refresh_all_song_rows:
+            rows = self.library_song_rows + self.playlist_song_rows
+        else:
+            rows = list(self._dirty_song_rows)
+        self._refresh_all_song_rows = False
+        self._dirty_song_rows.clear()
+        for row in rows:
+            try:
+                if row.winfo_exists():
+                    row._refresh_layout()
+            except Exception:
+                continue
+
+    def _on_dpi_scaling_changed(self, _event=None):
+        self._canvas_scale = self._get_canvas_scale()
+        font_theme = ctk.ThemeManager.theme["CTkFont"]
+        font_size = max(1, round(font_theme["size"] * self._canvas_scale))
+        self.song_canvas_font.configure(size=-font_size)
+        self.control_canvas_font.configure(size=-font_size)
+        for row in self.library_song_rows + self.playlist_song_rows:
+            try:
+                if row.winfo_exists():
+                    row.set_scale(self._canvas_scale)
+            except Exception:
+                continue
+        self._schedule_row_refresh()
+
+    def destroy(self):
+        if self._destroying:
+            return
+
+        if self._row_refresh_job is not None:
+            try:
+                self.after_cancel(self._row_refresh_job)
+            except Exception:
+                pass
+            self._row_refresh_job = None
+        self._dirty_song_rows.clear()
+        self._refresh_all_song_rows = False
+        for row in self.library_song_rows + self.playlist_song_rows:
+            try:
+                row.destroy()
+            except Exception:
+                pass
+        self.library_song_rows.clear()
+        self.playlist_song_rows.clear()
+
+        super().destroy()
 
     def on_next(self):
         if not self.selected_files:
             return 
-        self.callback(self.selected_files)
+        callback = self.callback
+        selected_files = list(self.selected_files)
         self.destroy()
+        callback(selected_files)
+
+    def on_back(self):
+        callback = self.back_callback
+        selected_files = list(self.selected_files)
+        self.destroy()
+        callback(selected_files)
 
 # ========================================================
 # NEW: 弹窗类：步骤 0/3 设置时间和模式
 # ========================================================
-class TimeModeDialog(ctk.CTkToplevel):
+class TimeModeDialog(TaskFlowWindow):
     def __init__(self, parent, callback, initial_data=None):
         super().__init__(parent)
         self.callback = callback
         self.title("任务设置: 时间与模式")
-        self.attributes("-topmost", True)
-        self.grab_set()
         self.resizable(False, False)
 
         # 默认值
@@ -399,7 +1244,7 @@ class TimeModeDialog(ctk.CTkToplevel):
         return None
 
     def show_alert(self, msg):
-        top = ctk.CTkToplevel(self)
+        top = DpiStableToplevel(self)
         top.geometry("250x150")
         top.attributes("-topmost", True)
         ctk.CTkLabel(top, text=msg, wraplength=220).pack(expand=True)
@@ -426,17 +1271,19 @@ class TimeModeDialog(ctk.CTkToplevel):
             # 模式一：强制清空结束时间，确保不保存脏数据
             end_t = ""
 
-        self.callback({
+        callback = self.callback
+        config_data = {
             "time": start_t,
             "mode": mode,
             "end_time": end_t
-        })
+        }
         self.destroy()
+        callback(config_data)
 
 # ========================================================
 # 4. 主程序逻辑
 # ========================================================
-class MusicSchedulerApp(ctk.CTk):
+class MusicSchedulerApp(DpiStableCTk):
     def __init__(self):
         super().__init__()
 
@@ -461,6 +1308,7 @@ class MusicSchedulerApp(ctk.CTk):
 
         self.tasks = []
         self.music_files = []
+        self.active_task_dialog = None
         
         # 播放状态变量
         self.playlist_queue = []      
@@ -530,7 +1378,7 @@ class MusicSchedulerApp(ctk.CTk):
             self.status_label.configure(text="无历史任务记录", text_color="gray")
 
     def show_error_alert(self, msg):
-        err_win = ctk.CTkToplevel(self)
+        err_win = DpiStableToplevel(self)
         err_win.title("操作提示")
         err_win.geometry("320x180")
         err_win.resizable(False, False)
@@ -705,7 +1553,7 @@ class MusicSchedulerApp(ctk.CTk):
                 pass
 
     def show_help_window(self, forced_countdown=False):
-        help_win = ctk.CTkToplevel(self)
+        help_win = DpiStableToplevel(self)
         help_win.title("使用说明")
         help_win.geometry("480x550") 
         help_win.attributes("-topmost", True)
@@ -763,7 +1611,7 @@ class MusicSchedulerApp(ctk.CTk):
             help_win.after(1000, update_countdown)
 
     def show_startup_error(self, error_msg):
-        err_win = ctk.CTkToplevel(self)
+        err_win = DpiStableToplevel(self)
         err_win.title("设置失败")
         err_win.geometry("300x200")
         err_win.attributes("-topmost", True)
@@ -836,7 +1684,7 @@ class MusicSchedulerApp(ctk.CTk):
         
         # 清空列表
         for widget in self.music_list_scroll.winfo_children():
-            widget.destroy()
+            destroy_widget_tree(widget)
             
         found_files = []
         allowed_extensions = ('.mp3', '.flac', '.wav', '.ogg', '.m4a', '.wma', '.aac')
@@ -864,28 +1712,135 @@ class MusicSchedulerApp(ctk.CTk):
         self.status_label.configure(text=f"刷新成功，找到 {len(found_files)} 个音频文件", text_color="green")
 
     # --- 新的添加任务流程 ---
+    def focus_active_task_dialog(self):
+        """激活当前任务向导，并阻止并行打开第二条创建或修改流程。"""
+        dialog = self.active_task_dialog
+        if dialog is None:
+            return False
+        try:
+            if dialog.winfo_exists():
+                dialog.focus_task_window()
+                return True
+        except Exception:
+            pass
+        self.active_task_dialog = None
+        return False
+
     def initiate_add_task_flow(self):
+        if self.focus_active_task_dialog():
+            return
         if not self.music_files:
             self.show_error_alert("没有扫描到音频文件\n请先点击左侧【刷新音乐列表】")
             return
         # 步骤 0: 设置时间与模式
-        TimeModeDialog(self, callback=self.step_1_songs)
+        TimeModeDialog(
+            self,
+            callback=lambda config: self.start_task_wizard_draft(config)
+        )
 
-    def step_1_songs(self, config_data):
-        # config_data: {'time': '..', 'mode': '..', 'end_time': '..'}
-        MultiSongSelectDialog(self, self.music_files, 
-                              lambda files: self.step_2_weekdays(config_data, files))
+    def start_task_wizard_draft(self, config_data, edit_index=None):
+        """创建只存在于内存的向导草稿，完成前不修改任务数据。"""
+        if edit_index is None:
+            draft = {
+                "config": dict(config_data),
+                "files": [],
+                "weekdays": None,
+                "name": None,
+                "edit_index": None,
+            }
+        else:
+            if not (0 <= edit_index < len(self.tasks)):
+                return
+            task = self.tasks[edit_index]
+            draft = {
+                "config": dict(config_data),
+                "files": list(task.get("files", [])),
+                "weekdays": list(task.get("weekdays", [])),
+                "name": task.get("name", ""),
+                "edit_index": edit_index,
+            }
+        self.show_wizard_song_step(draft)
 
-    def step_2_weekdays(self, config_data, file_list):
-        WeekdaySelectionDialog(self, config_data['time'], len(file_list),
-                               lambda weekdays: self.step_3_rename(config_data, file_list, weekdays))
+    def show_wizard_song_step(self, draft):
+        initial_files = list(draft["files"]) if draft["files"] else None
+        MultiSongSelectDialog(
+            self,
+            self.music_files,
+            callback=lambda files: self.on_wizard_songs_next(draft, files),
+            back_callback=lambda files: self.on_wizard_songs_back(draft, files),
+            initial_selection=initial_files
+        )
 
-    def step_3_rename(self, config_data, file_list, weekdays):
-        default_name = os.path.basename(file_list[0])
-        if len(file_list) > 1:
-            default_name += f" 等{len(file_list)}首"
-        TaskRenameDialog(self, default_name,
-                         lambda name: self.finalize_add_task(config_data, file_list, name, weekdays))
+    def on_wizard_songs_back(self, draft, file_list):
+        draft["files"] = list(file_list)
+        TimeModeDialog(
+            self,
+            callback=lambda config: self.on_wizard_time_next(draft, config),
+            initial_data=draft["config"]
+        )
+
+    def on_wizard_time_next(self, draft, config_data):
+        draft["config"] = dict(config_data)
+        self.show_wizard_song_step(draft)
+
+    def on_wizard_songs_next(self, draft, file_list):
+        draft["files"] = list(file_list)
+        self.show_wizard_weekday_step(draft)
+
+    def show_wizard_weekday_step(self, draft):
+        initial_weekdays = draft["weekdays"]
+        if initial_weekdays is not None:
+            initial_weekdays = list(initial_weekdays)
+        WeekdaySelectionDialog(
+            self,
+            draft["config"]["time"],
+            len(draft["files"]),
+            callback=lambda weekdays: self.on_wizard_weekdays_next(draft, weekdays),
+            back_callback=lambda weekdays: self.on_wizard_weekdays_back(draft, weekdays),
+            initial_selection=initial_weekdays
+        )
+
+    def on_wizard_weekdays_back(self, draft, weekdays):
+        draft["weekdays"] = list(weekdays)
+        self.show_wizard_song_step(draft)
+
+    def on_wizard_weekdays_next(self, draft, weekdays):
+        draft["weekdays"] = list(weekdays)
+        self.show_wizard_name_step(draft)
+
+    def show_wizard_name_step(self, draft):
+        default_name = os.path.basename(draft["files"][0])
+        if len(draft["files"]) > 1:
+            default_name += f" 等{len(draft['files'])}首"
+        TaskRenameDialog(
+            self,
+            default_name,
+            callback=lambda name: self.finish_task_wizard(draft, name),
+            back_callback=lambda name: self.on_wizard_name_back(draft, name),
+            initial_name=draft["name"]
+        )
+
+    def on_wizard_name_back(self, draft, draft_name):
+        draft["name"] = draft_name
+        self.show_wizard_weekday_step(draft)
+
+    def finish_task_wizard(self, draft, display_name):
+        draft["name"] = display_name
+        if draft["edit_index"] is None:
+            self.finalize_add_task(
+                draft["config"],
+                draft["files"],
+                draft["name"],
+                draft["weekdays"]
+            )
+        else:
+            self.finalize_modify(
+                draft["edit_index"],
+                draft["config"],
+                draft["files"],
+                draft["weekdays"],
+                draft["name"]
+            )
 
     def finalize_add_task(self, config, f_list, display_name, weekdays_indices):
         self.tasks.append({
@@ -903,6 +1858,8 @@ class MusicSchedulerApp(ctk.CTk):
 
     # --- 新的修改任务流程 ---
     def start_modify_task(self, index):
+        if self.focus_active_task_dialog():
+            return
         if not (0 <= index < len(self.tasks)): return
         
         task = self.tasks[index]
@@ -916,25 +1873,8 @@ class MusicSchedulerApp(ctk.CTk):
         }
         
         TimeModeDialog(self, 
-                       callback=lambda cfg: self.modify_step_1(index, cfg),
+                       callback=lambda cfg: self.start_task_wizard_draft(cfg, index),
                        initial_data=initial_config)
-
-    def modify_step_1(self, index, new_config):
-        task = self.tasks[index]
-        MultiSongSelectDialog(self, self.music_files,
-                              lambda files: self.modify_step_2(index, new_config, files),
-                              initial_selection=task['files'])
-
-    def modify_step_2(self, index, new_config, new_files):
-        task = self.tasks[index]
-        WeekdaySelectionDialog(self, new_config['time'], len(new_files),
-                               lambda weekdays: self.modify_step_3(index, new_config, new_files, weekdays),
-                               initial_selection=task.get('weekdays', []))
-
-    def modify_step_3(self, index, new_config, new_files, new_weekdays):
-        task = self.tasks[index]
-        TaskRenameDialog(self, task['name'],
-                         lambda name: self.finalize_modify(index, new_config, new_files, new_weekdays, name))
 
     def finalize_modify(self, index, config, f_list, weekdays_indices, display_name):
         self.tasks[index]['time'] = config['time']
@@ -961,7 +1901,7 @@ class MusicSchedulerApp(ctk.CTk):
 
     def refresh_task_list(self):
         for widget in self.schedule_scroll.winfo_children():
-            widget.destroy()
+            destroy_widget_tree(widget)
         self.tasks.sort(key=lambda x: x["time"])
         
         week_map = ["一", "二", "三", "四", "五", "六", "日"]
