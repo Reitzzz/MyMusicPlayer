@@ -28,21 +28,6 @@ from task_dialogs import (
     format_clock_for_display,
 )
 
-# ========================================================
-# 核心修复：强制设置工作目录为 exe 所在目录
-# ========================================================
-def resource_path(relative_path):
-    """ 获取资源的绝对路径，适配开发环境和打包后的 exe 环境 """
-    try:
-        # PyInstaller 创建临时文件夹，路径存储在 _MEIPASS 中
-        base_path = sys._MEIPASS
-    except Exception:
-        # 正常运行模式，使用当前脚本所在的目录
-        base_path = os.path.abspath(os.path.dirname(sys.argv[0]))
-        # 如果是 exe 运行，sys.argv[0] 就是 exe 的路径，dirname 就是 exe 所在文件夹
-    
-    return os.path.join(base_path, relative_path)
-
 # 获取当前程序（exe或py）所在的真实目录
 if getattr(sys, 'frozen', False):
     # 如果是打包后的 exe
@@ -568,26 +553,35 @@ class MusicSchedulerApp(DpiStableCTk):
             callback=lambda config: self.start_task_wizard_draft(config)
         )
 
-    def start_task_wizard_draft(self, config_data, edit_index=None):
+    def ensure_edit_task_available(self, edit_task):
+        """确认修改目标仍存在，避免非模态向导提交到错误任务。"""
+        if any(task is edit_task for task in self.tasks):
+            return True
+
+        message = "原任务已被删除，修改已取消"
+        self.status_label.configure(text=message, text_color="orange")
+        self.show_error_alert(message)
+        return False
+
+    def start_task_wizard_draft(self, config_data, edit_task=None):
         """创建只存在于内存的向导草稿，完成前不修改任务数据。"""
-        if edit_index is None:
+        if edit_task is None:
             draft = {
                 "config": dict(config_data),
                 "files": [],
                 "weekdays": None,
                 "name": None,
-                "edit_index": None,
+                "edit_task": None,
             }
         else:
-            if not (0 <= edit_index < len(self.tasks)):
+            if not self.ensure_edit_task_available(edit_task):
                 return
-            task = self.tasks[edit_index]
             draft = {
                 "config": dict(config_data),
-                "files": list(task.get("files", [])),
-                "weekdays": list(task.get("weekdays", [])),
-                "name": task.get("name", ""),
-                "edit_index": edit_index,
+                "files": list(edit_task.get("files", [])),
+                "weekdays": list(edit_task.get("weekdays", [])),
+                "name": edit_task.get("name", ""),
+                "edit_task": edit_task,
             }
         self.show_wizard_song_step(draft)
 
@@ -656,7 +650,7 @@ class MusicSchedulerApp(DpiStableCTk):
 
     def finish_task_wizard(self, draft, display_name):
         draft["name"] = display_name
-        if draft["edit_index"] is None:
+        if draft["edit_task"] is None:
             self.finalize_add_task(
                 draft["config"],
                 draft["files"],
@@ -665,7 +659,7 @@ class MusicSchedulerApp(DpiStableCTk):
             )
         else:
             self.finalize_modify(
-                draft["edit_index"],
+                draft["edit_task"],
                 draft["config"],
                 draft["files"],
                 draft["weekdays"],
@@ -705,19 +699,22 @@ class MusicSchedulerApp(DpiStableCTk):
         }
         
         TimeModeDialog(self, 
-                       callback=lambda cfg: self.start_task_wizard_draft(cfg, index),
+                       callback=lambda cfg, edit_task=task: self.start_task_wizard_draft(cfg, edit_task),
                        initial_data=initial_config)
 
-    def finalize_modify(self, index, config, f_list, weekdays_indices, display_name):
-        self.tasks[index]['time'] = config['time']
-        self.tasks[index]['mode'] = config['mode']
-        self.tasks[index]['end_time'] = config['end_time']
-        self.tasks[index]['end_next_day'] = bool(config.get('end_next_day', False))
-        self.tasks[index]['files'] = [make_portable_music_path(path) for path in f_list]
-        self.tasks[index]['weekdays'] = weekdays_indices
-        self.tasks[index]['name'] = display_name
+    def finalize_modify(self, edit_task, config, f_list, weekdays_indices, display_name):
+        if not self.ensure_edit_task_available(edit_task):
+            return
+
+        edit_task['time'] = config['time']
+        edit_task['mode'] = config['mode']
+        edit_task['end_time'] = config['end_time']
+        edit_task['end_next_day'] = bool(config.get('end_next_day', False))
+        edit_task['files'] = [make_portable_music_path(path) for path in f_list]
+        edit_task['weekdays'] = weekdays_indices
+        edit_task['name'] = display_name
         # 保持原有的启用/禁用状态，如果没有则默认为 True
-        self.tasks[index]['enabled'] = self.tasks[index].get('enabled', True)
+        edit_task['enabled'] = edit_task.get('enabled', True)
         
         self.save_tasks() # 保存
         self.refresh_task_list()
@@ -796,7 +793,6 @@ class MusicSchedulerApp(DpiStableCTk):
             del self.tasks[index]
             self.save_tasks() # 保存
             self.refresh_task_list()
-            self.update_top_status()
 
     def start_playlist(self, task):
         self.playlist_queue = list(task.get("files", []))
