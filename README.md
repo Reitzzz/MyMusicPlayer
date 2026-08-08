@@ -72,7 +72,7 @@ D:\Python\python.exe music.py
 代码语法检查：
 
 ```powershell
-D:\Python\python.exe -m py_compile music.py
+D:\Python\python.exe -m py_compile music.py windowing.py song_widgets.py task_dialogs.py
 ```
 
 ## 打包 Windows EXE
@@ -104,15 +104,49 @@ MusicScheduler-Pro/
 
 ```text
 MusicPlayer/
-├── music.py        # 主程序、UI、调度与播放逻辑
-├── music.spec      # PyInstaller 打包配置
-├── config.json     # 本地程序配置
-├── tasks.json      # 本地任务数据
-├── mp3/            # 普通音乐目录
-├── changyong/      # 常用音乐目录
-├── AGENTS.md       # 自动化代理协作约定
+├── music.py          # 程序入口、主界面、任务协调、调度与播放逻辑
+├── windowing.py      # DPI 控制、窗口基类和父子窗口状态同步
+├── song_widgets.py   # 轻量歌曲行、文字省略与悬停跑马灯
+├── task_dialogs.py   # 时间、歌曲、星期和命名任务向导
+├── music.spec        # PyInstaller 打包配置
+├── config.json       # 本地程序配置
+├── tasks.json        # 本地任务数据
+├── mp3/              # 普通音乐目录
+├── changyong/        # 常用音乐目录
+├── AGENTS.md         # 自动化代理协作约定
 └── README.md
 ```
+
+### 当前代码拆分原则
+
+当前拆分属于不改变程序行为的第一阶段整理：
+
+- `music.py` 仍是唯一启动入口，`music.spec` 不需要改用其他入口。
+- `windowing.py` 不依赖主程序，只提供可复用的 DPI 和窗口能力。
+- `song_widgets.py` 只负责歌曲行绘制和交互，不读取任务或配置。
+- `task_dialogs.py` 通过父窗口与回调连接主程序，不反向导入 `music.py`。
+- `music.py` 继续重导出拆出的窗口和控件类，兼容已有的 `import music` 调试代码。
+
+依赖方向保持为：`song_widgets.py` 和 `windowing.py` → `task_dialogs.py` → `music.py`。禁止基础模块反向导入 `music.py`，避免循环导入。
+
+### 什么时候进入第二阶段拆分
+
+目前不应仅因为文件行数继续拆分。出现以下任一情况时，再考虑提取独立的任务存储、音频播放和调度服务：
+
+- 任务 JSON 开始需要版本迁移、字段校验、自动备份、恢复或被多个模块同时读写。
+- 音频功能加入暂停、音量、淡入淡出、输出设备切换、播放失败恢复，导致播放状态继续散落在主界面中。
+- 调度需要支持跨午夜、系统休眠后补触发、时区、冲突任务或无需 GUI 的后台运行。
+- 连续的功能修改必须同时改动主界面、播放状态和调度循环，已经难以单独验证其中一项。
+- `MusicSchedulerApp` 的共享状态使后台线程直接依赖控件，或问题只能通过启动完整 GUI 才能复现。
+
+进入第二阶段前，应先为以下纯逻辑补充自动化测试：
+
+- 任务数据的读取、保存、默认值和旧数据兼容。
+- 音频队列的下一首、循环、失败跳过和停止状态转换。
+- 下次运行时间、星期匹配、跨日期边界和重复触发保护。
+- 音频路径的相对化、程序目录迁移和文件缺失处理。
+
+测试稳定后，再依次提取 `TaskStore`、`PlaybackEngine` 和 `SchedulerService`。这些服务应通过普通参数、返回值、回调或线程安全队列与 UI 通信，Tk 控件仍只允许在主线程更新。
 
 ## 使用注意事项
 
