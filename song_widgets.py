@@ -21,6 +21,10 @@ class SongRowCanvas(tk.Canvas):
         scale=1.0,
         index_text=None,
         actions=None,
+        drag_handle=None,
+        on_drag_start=None,
+        on_drag_motion=None,
+        on_drag_end=None,
         layout_scheduler=None,
     ):
         self.full_text = full_text
@@ -29,6 +33,11 @@ class SongRowCanvas(tk.Canvas):
         self.background = background
         self.index_text = index_text
         self.actions = [dict(action) for action in (actions or []) if action]
+        self.drag_handle = dict(drag_handle) if drag_handle else None
+        self._on_drag_start_callback = on_drag_start
+        self._on_drag_motion_callback = on_drag_motion
+        self._on_drag_end_callback = on_drag_end
+        self._dragging = False
         self._layout_scheduler = layout_scheduler
         self._scale = max(0.5, float(scale))
         self._destroying = False
@@ -45,6 +54,8 @@ class SongRowCanvas(tk.Canvas):
         self._text_left = 0
         self._text_right = 0
         self._action_hitboxes = {}
+        self._drag_handle_hitbox = None
+        self._drop_indicator_position = None
         self._ellipsis_cache = {}
         self._full_text_width = 0
         self._prefix_widths = []
@@ -93,6 +104,15 @@ class SongRowCanvas(tk.Canvas):
                 fill="#858585",
                 font=self.text_font,
             )
+        self._drag_handle_item = None
+        if self.drag_handle is not None:
+            self._drag_handle_item = self.create_text(
+                0,
+                0,
+                text=self.drag_handle.get("text", "≡"),
+                fill=self.drag_handle.get("text_color", "#858585"),
+                font=self.control_font,
+            )
 
         for action in self.actions:
             action["shape_item"] = self.create_polygon(
@@ -109,11 +129,16 @@ class SongRowCanvas(tk.Canvas):
                 fill=action["text_color"],
                 font=self.control_font,
             )
+        self._drop_indicator_item = self.create_rectangle(
+            0, 0, 0, 0, fill="#3B8ED0", outline="", state="hidden"
+        )
 
         self.bind("<Configure>", self._on_configure)
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_click)
+        self.bind("<ButtonPress-1>", self._on_button_press)
+        self.bind("<B1-Motion>", self._on_drag_motion)
+        self.bind("<ButtonRelease-1>", self._on_button_release)
 
     def _px(self, logical_value):
         return max(1, round(logical_value * self._scale))
@@ -178,7 +203,7 @@ class SongRowCanvas(tk.Canvas):
             self._text_left = self._px(5)
             control_width = self._px(40)
         else:
-            self._text_left = self._px(36)
+            self._text_left = self._px(54 if self.drag_handle is not None else 36)
             control_width = self._px(96)
         self._text_right = max(self._text_left, width - control_width - self._px(3))
 
@@ -186,6 +211,13 @@ class SongRowCanvas(tk.Canvas):
         self.coords(self._right_mask_item, self._text_right, 0, width, height)
         if self._index_item is not None:
             self.coords(self._index_item, self._px(5), center_y)
+        if self._drag_handle_item is not None:
+            handle_left = self._px(27)
+            handle_right = self._px(47)
+            self._drag_handle_hitbox = (handle_left, 0, handle_right, height)
+            self.coords(self._drag_handle_item, (handle_left + handle_right) / 2, center_y)
+        else:
+            self._drag_handle_hitbox = None
 
         self._action_hitboxes.clear()
         if self.index_text is None:
@@ -232,6 +264,31 @@ class SongRowCanvas(tk.Canvas):
             )
 
         self._refresh_text()
+        self._refresh_drop_indicator()
+
+    def set_drop_indicator(self, position):
+        """Display the insertion line above or below this row during a drag."""
+        if position not in ("top", "bottom"):
+            position = None
+        if position == self._drop_indicator_position:
+            return
+        self._drop_indicator_position = position
+        self._refresh_drop_indicator()
+
+    def _refresh_drop_indicator(self):
+        if self._drop_indicator_position is None:
+            self.itemconfigure(self._drop_indicator_item, state="hidden")
+            return
+        width = max(1, self.winfo_width())
+        height = max(1, self.winfo_height())
+        line_height = max(2, self._px(2))
+        line_y = 0 if self._drop_indicator_position == "top" else height - line_height
+        self.coords(
+            self._drop_indicator_item,
+            self._px(2), line_y, width - self._px(2), line_y + line_height,
+        )
+        self.itemconfigure(self._drop_indicator_item, state="normal")
+        self.tag_raise(self._drop_indicator_item)
 
     def _fit_text(self, available_width):
         available_width = max(0, int(available_width))
@@ -307,6 +364,12 @@ class SongRowCanvas(tk.Canvas):
                 return key
         return None
 
+    def _on_drag_handle(self, x, y):
+        if self._drag_handle_hitbox is None:
+            return False
+        x1, y1, x2, y2 = self._drag_handle_hitbox
+        return x1 <= x < x2 and y1 <= y < y2
+
     def _on_motion(self, event):
         action_key = self._action_at(event.x, event.y)
         if action_key != self._hovered_action:
@@ -315,7 +378,7 @@ class SongRowCanvas(tk.Canvas):
                 fill = action["hover_fill"] if action["key"] == action_key else action["fill"]
                 self.itemconfigure(action["shape_item"], fill=fill)
 
-        cursor_name = "hand2" if action_key is not None else ""
+        cursor_name = "hand2" if action_key is not None or self._on_drag_handle(event.x, event.y) else ""
         if cursor_name != self._cursor_name:
             self._cursor_name = cursor_name
             self.configure(cursor=cursor_name)
@@ -333,7 +396,14 @@ class SongRowCanvas(tk.Canvas):
             self._cursor_name = ""
             self.configure(cursor="")
 
-    def _on_click(self, event):
+    def _on_button_press(self, event):
+        if self._on_drag_handle(event.x, event.y):
+            self._dragging = True
+            self.grab_set()
+            if self._on_drag_start_callback is not None:
+                self._on_drag_start_callback(self, event)
+            return
+
         action_key = self._action_at(event.x, event.y)
         if action_key is None:
             return
@@ -341,6 +411,21 @@ class SongRowCanvas(tk.Canvas):
             if action["key"] == action_key:
                 action["command"]()
                 return
+
+    def _on_drag_motion(self, event):
+        if self._dragging and self._on_drag_motion_callback is not None:
+            self._on_drag_motion_callback(self, event)
+
+    def _on_button_release(self, event):
+        if not self._dragging:
+            return
+        self._dragging = False
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        if self._on_drag_end_callback is not None:
+            self._on_drag_end_callback(self, event)
 
     def _start_animation(self):
         self._animation_job = None

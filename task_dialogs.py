@@ -241,6 +241,8 @@ class MultiSongSelectDialog(TaskFlowWindow):
         self.selected_files = list(initial_selection) if initial_selection else []
         self.library_song_rows = []
         self.playlist_song_rows = []
+        self._dragged_playlist_index = None
+        self._drag_target_index = None
         self._row_refresh_job = None
         self._dirty_song_rows = set()
         self._refresh_all_song_rows = False
@@ -280,7 +282,7 @@ class MultiSongSelectDialog(TaskFlowWindow):
 
         right_frame = ctk.CTkFrame(content_frame)
         right_frame.pack(side="right", fill="both", expand=True, padx=5)
-        ctk.CTkLabel(right_frame, text="播放顺序 (从上到下)", text_color="#1F6AA5", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+        ctk.CTkLabel(right_frame, text="播放顺序 (从上到下，可拖动 ≡ 调整)", text_color="#1F6AA5", font=ctk.CTkFont(weight="bold")).pack(pady=5)
 
         self.scroll_playlist = ctk.CTkScrollableFrame(right_frame)
         self.scroll_playlist.pack(fill="both", expand=True, padx=5, pady=5)
@@ -386,6 +388,63 @@ class MultiSongSelectDialog(TaskFlowWindow):
             self.selected_files[index], self.selected_files[index+1] = self.selected_files[index+1], self.selected_files[index]
             self.update_playlist_ui()
 
+    def _start_song_drag(self, row, _event):
+        try:
+            self._dragged_playlist_index = self.playlist_song_rows.index(row)
+            self._drag_target_index = self._dragged_playlist_index
+        except ValueError:
+            self._dragged_playlist_index = None
+            self._drag_target_index = None
+
+    def _show_song_drag_target(self, target_index):
+        last_index = len(self.playlist_song_rows) - 1
+        for index, playlist_row in enumerate(self.playlist_song_rows):
+            if target_index == index:
+                position = "top"
+            elif target_index == len(self.playlist_song_rows) and index == last_index:
+                position = "bottom"
+            else:
+                position = None
+            playlist_row.set_drop_indicator(position)
+
+    def _playlist_insert_index_at(self, event):
+        left = self.scroll_playlist.winfo_rootx()
+        top = self.scroll_playlist.winfo_rooty()
+        right = left + self.scroll_playlist.winfo_width()
+        bottom = top + self.scroll_playlist.winfo_height()
+        if not (left <= event.x_root <= right and top <= event.y_root <= bottom):
+            return None
+
+        for index, row in enumerate(self.playlist_song_rows):
+            midpoint = row.winfo_rooty() + row.winfo_height() / 2
+            if event.y_root < midpoint:
+                return index
+        return len(self.playlist_song_rows)
+
+    def _update_song_drag(self, _row, event):
+        if self._dragged_playlist_index is None:
+            return
+        self._drag_target_index = self._playlist_insert_index_at(event)
+        self._show_song_drag_target(self._drag_target_index)
+
+    def _finish_song_drag(self, _row, event):
+        source_index = self._dragged_playlist_index
+        target_index = self._playlist_insert_index_at(event)
+        self._dragged_playlist_index = None
+        self._drag_target_index = None
+        self._show_song_drag_target(None)
+        if source_index is None or target_index is None:
+            return
+
+        if target_index > source_index:
+            target_index -= 1
+        if target_index == source_index:
+            return
+
+        song = self.selected_files.pop(source_index)
+        self.selected_files.insert(target_index, song)
+        self.update_playlist_ui()
+
     def update_playlist_ui(self):
         try:
             for row in self.playlist_song_rows:
@@ -435,6 +494,10 @@ class MultiSongSelectDialog(TaskFlowWindow):
                     scale=self._canvas_scale,
                     index_text=f"{idx + 1}.",
                     actions=actions,
+                    drag_handle={"text": "≡", "text_color": "#858585"},
+                    on_drag_start=self._start_song_drag,
+                    on_drag_motion=self._update_song_drag,
+                    on_drag_end=self._finish_song_drag,
                     layout_scheduler=self._schedule_row_refresh,
                 )
                 row.pack(
