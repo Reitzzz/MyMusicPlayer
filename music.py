@@ -366,7 +366,7 @@ class MusicSchedulerApp(DpiStableCTk):
         self.footer_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.status_label = ctk.CTkLabel(self.footer_frame, text="就绪", text_color="gray")
         self.status_label.pack(side="left", padx=20)
-        ctk.CTkLabel(self.footer_frame, text="v7.1 Pro", font=ctk.CTkFont(size=10)).pack(side="right", padx=20)
+        ctk.CTkLabel(self.footer_frame, text="v1.2.0 Pro", font=ctk.CTkFont(size=10)).pack(side="right", padx=20)
     
     def check_first_run(self):
         # 强制切换工作目录后，直接读 config.json 即可
@@ -394,21 +394,24 @@ class MusicSchedulerApp(DpiStableCTk):
         scroll_help.pack(fill="both", expand=True, padx=20, pady=5)
         
         text_process = (
-            "1. 【使用流程】\n"
+            "1. 【创建任务】\n"
             "   ① 将音频文件放入软件目录下的 mp3 或 changyong 文件夹\n"
-            "   ② 点击左侧“刷新音乐列表”\n"
-            "   ③ 输入时间，点击“开始创建任务”\n"
+            "   ② 点击左侧“刷新音乐列表”，再点击“+ 创建新任务”\n"
+            "   ③ 设置开始时间和播放行为\n"
             "   ④ 按向导依次完成：选择歌曲 -> 设置星期 -> 设置任务名称\n\n"
-            "2. 【修改任务】\n"
-            "   在任务列表中点击“修改”按钮，可以重新设置该任务的\n"
-            "   时间、歌曲、播放星期和名称。\n\n"
-            "3. 【静默运行】\n"
-            "   程序启动时会自动隐藏界面，仅在右下角托盘显示图标。\n"
-            "   点击右上角关闭按钮，程序也会最小化到托盘继续运行。\n\n"
-            "4. 【注意事项】\n"
+            "2. 【时间与播放模式】\n"
+            "   时间由小时和分钟两栏组成；可输入数字、使用上下键、\n"
+            "   鼠标滚轮或右侧按钮调整，也可粘贴如 13:00 或 1300。\n"
+            "   “固定曲目”会按顺序播放一次；“固定时长”会循环播放。\n"
+            "   如需跨午夜，请在固定时长模式勾选“次日结束”。\n\n"
+            "3. 【修改任务】\n"
+            "   在任务列表中点击“修改”按钮，可以重新设置时间、歌曲、\n"
+            "   播放星期和名称。\n\n"
+            "4. 【托盘与注意事项】\n"
+            "   普通启动会显示主窗口；开机自启会静默启动并显示托盘图标。\n"
+            "   点击右上角关闭按钮会隐藏窗口；请在托盘菜单中选择“退出程序”\n"
+            "   才能彻底退出。\n"
             "   - 支持格式：mp3, flac, wav, ogg, m4a, wma, aac\n"
-            "   - 时间示例：130000, 13:00:00, 13：00：00\n"
-            "     (支持纯数字、英文冒号及中文冒号)\n"
             "   - 请务必禁用电脑自动休眠，以免影响播放"
         )
         ctk.CTkLabel(scroll_help, text=text_process, justify="left", font=ctk.CTkFont(size=14), anchor="w").pack(fill="x", pady=5)
