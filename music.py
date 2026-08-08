@@ -25,6 +25,7 @@ from task_dialogs import (
     WeekdaySelectionDialog,
     MultiSongSelectDialog,
     TimeModeDialog,
+    format_clock_for_display,
 )
 
 # ========================================================
@@ -91,6 +92,21 @@ def make_portable_music_path(path_value):
         return str(resolved_path)
 
 
+def calculate_task_end_at(task, started_at):
+    """Calculate the concrete stop datetime for a duration-mode task."""
+    if task.get("mode", "song") != "duration":
+        return None
+    try:
+        end_clock = datetime.strptime(task.get("end_time", ""), "%H:%M:%S").time()
+    except (TypeError, ValueError):
+        return None
+
+    end_at = datetime.combine(started_at.date(), end_clock)
+    if bool(task.get("end_next_day", False)):
+        end_at += timedelta(days=1)
+    return end_at
+
+
 # ========================================================
 # 4. 主程序逻辑
 # ========================================================
@@ -127,7 +143,7 @@ class MusicSchedulerApp(DpiStableCTk):
         self.is_playlist_active = False 
         self.current_task_name = "" 
         self.current_task_mode = "song" 
-        self.current_task_end_time = "" 
+        self.current_task_end_at = None
 
         # 主循环与跨线程事件状态
         self.running = True
@@ -658,6 +674,7 @@ class MusicSchedulerApp(DpiStableCTk):
             "time": config['time'], 
             "mode": config['mode'],
             "end_time": config['end_time'],
+            "end_next_day": bool(config.get('end_next_day', False)),
             "files": [make_portable_music_path(path) for path in f_list],
             "name": display_name,
             "weekdays": weekdays_indices,
@@ -680,7 +697,8 @@ class MusicSchedulerApp(DpiStableCTk):
         initial_config = {
             "time": task['time'],
             "mode": task.get('mode', 'song'),
-            "end_time": task.get('end_time', '')
+            "end_time": task.get('end_time', ''),
+            "end_next_day": bool(task.get('end_next_day', False)),
         }
         
         TimeModeDialog(self, 
@@ -691,6 +709,7 @@ class MusicSchedulerApp(DpiStableCTk):
         self.tasks[index]['time'] = config['time']
         self.tasks[index]['mode'] = config['mode']
         self.tasks[index]['end_time'] = config['end_time']
+        self.tasks[index]['end_next_day'] = bool(config.get('end_next_day', False))
         self.tasks[index]['files'] = [make_portable_music_path(path) for path in f_list]
         self.tasks[index]['weekdays'] = weekdays_indices
         self.tasks[index]['name'] = display_name
@@ -730,9 +749,11 @@ class MusicSchedulerApp(DpiStableCTk):
             
             # 显示时间段 (如果是模式二)
             mode = task.get("mode", "song")
-            time_display = task["time"]
+            time_display = format_clock_for_display(task["time"])
             if mode == "duration":
-                time_display += f" - {task.get('end_time','?')}"
+                next_day_prefix = "次日 " if task.get("end_next_day", False) else ""
+                end_display = format_clock_for_display(task.get("end_time", "?"))
+                time_display += f" - {next_day_prefix}{end_display}"
                 mode_str = "[时长]"
             else:
                 mode_str = "[曲目]"
@@ -780,7 +801,7 @@ class MusicSchedulerApp(DpiStableCTk):
         self.is_playlist_active = True
         self.current_task_name = task["name"]
         self.current_task_mode = task.get("mode", "song")
-        self.current_task_end_time = task.get("end_time", "")
+        self.current_task_end_at = calculate_task_end_at(task, datetime.now())
         
         self.play_next_in_queue()
 
@@ -877,7 +898,7 @@ class MusicSchedulerApp(DpiStableCTk):
                     day_text = f"周{week_names[next_run.weekday()]}"
 
                 display_text = (
-                    f"下次: {day_text} {next_run.strftime('%H:%M:%S')} "
+                    f"下次: {day_text} {format_clock_for_display(next_run.strftime('%H:%M:%S'))} "
                     f"{next_task.get('name', '未命名任务')}"
                 )
                 self.next_task_label.configure(text=display_text, text_color="gray")
@@ -913,6 +934,7 @@ class MusicSchedulerApp(DpiStableCTk):
     def stop_music(self):
         self.is_playlist_active = False
         self.current_task_name = ""
+        self.current_task_end_at = None
         try:
             pygame.mixer.music.stop()
             pygame.mixer.music.unload()
@@ -954,8 +976,8 @@ class MusicSchedulerApp(DpiStableCTk):
 
             # 2. 检查当前播放是否需要处理
             if self.is_playlist_active:
-                if self.current_task_mode == "duration" and self.current_task_end_time:
-                    if current_time_str >= self.current_task_end_time:
+                if self.current_task_mode == "duration" and self.current_task_end_at:
+                    if now >= self.current_task_end_at:
                         self.stop_music()
                         self.status_label.configure(text="已达到设定结束时间", text_color="orange")
 

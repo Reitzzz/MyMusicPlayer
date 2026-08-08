@@ -8,7 +8,7 @@ from tkinter import font as tkfont
 import customtkinter as ctk
 
 from song_widgets import SongRowCanvas
-from windowing import DpiStableToplevel, TaskFlowWindow
+from windowing import TaskFlowWindow
 
 
 class TaskRenameDialog(TaskFlowWindow):
@@ -125,7 +125,7 @@ class WeekdaySelectionDialog(TaskFlowWindow):
 
         ctk.CTkLabel(
             content_frame,
-            text=f"任务时间: {time_str}",
+            text=f"任务时间: {format_clock_for_display(time_str)}",
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color="#1F6AA5",
         ).pack(pady=(25, 5))
@@ -523,124 +523,494 @@ class MultiSongSelectDialog(TaskFlowWindow):
         selected_files = list(self.selected_files)
         self.destroy()
         callback(selected_files)
-# ========================================================
-# NEW: 弹窗类：步骤 0/3 设置时间和模式
-# ========================================================
+
+
+def normalize_time_value(value):
+    """Return an ``(hour, minute)`` pair for supported legacy time formats."""
+    if value is None:
+        return None
+
+    clean_value = str(value).strip().replace("：", ":").replace(" ", "")
+    if not clean_value:
+        return None
+
+    second = 0
+    if ":" in clean_value:
+        parts = clean_value.split(":")
+        if len(parts) not in (2, 3) or any(not part.isdigit() for part in parts):
+            return None
+        hour, minute = int(parts[0]), int(parts[1])
+        if len(parts) == 3:
+            second = int(parts[2])
+    else:
+        if not clean_value.isdigit():
+            return None
+        if len(clean_value) <= 2:
+            hour, minute = int(clean_value), 0
+        elif len(clean_value) == 4:
+            hour, minute = int(clean_value[:2]), int(clean_value[2:])
+        elif len(clean_value) == 6:
+            hour = int(clean_value[:2])
+            minute = int(clean_value[2:4])
+            second = int(clean_value[4:])
+        else:
+            return None
+
+    if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+        return hour, minute
+    return None
+
+
+def format_clock_for_display(value):
+    """Hide zero seconds without concealing precision used by legacy tasks."""
+    try:
+        parsed = datetime.strptime(str(value), "%H:%M:%S")
+    except (TypeError, ValueError):
+        parsed_parts = normalize_time_value(value)
+        if parsed_parts is None:
+            return str(value or "--:--")
+        return f"{parsed_parts[0]:02d}:{parsed_parts[1]:02d}"
+    if parsed.second:
+        return parsed.strftime("%H:%M:%S")
+    return parsed.strftime("%H:%M")
+
+
+class TimeSpinInput(ctk.CTkFrame):
+    """Compact 24-hour segmented time input for keyboard and pointer users."""
+
+    _NORMAL_BORDER = ("#979DA2", "#565B5E")
+    _ERROR_BORDER = "#D13438"
+
+    def __init__(self, master, value="", command=None, **kwargs):
+        super().__init__(
+            master,
+            fg_color="transparent",
+            border_width=1,
+            border_color=self._NORMAL_BORDER,
+            corner_radius=8,
+            **kwargs,
+        )
+        self.command = command
+        self._updating = False
+        self._active_segment = "hour"
+        self.hour_var = ctk.StringVar(value="")
+        self.minute_var = ctk.StringVar(value="")
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(2, weight=1)
+
+        entry_options = {
+            "width": 58,
+            "height": 42,
+            "justify": "center",
+            "font": ctk.CTkFont(size=20, weight="bold"),
+            "border_width": 0,
+            "fg_color": "transparent",
+            "placeholder_text": "--",
+        }
+        self.hour_entry = ctk.CTkEntry(self, textvariable=self.hour_var, **entry_options)
+        self.hour_entry.grid(row=0, column=0, padx=(8, 2), pady=4)
+        ctk.CTkLabel(self, text=":", width=14, font=ctk.CTkFont(size=20, weight="bold")).grid(
+            row=0, column=1, pady=4
+        )
+        self.minute_entry = ctk.CTkEntry(self, textvariable=self.minute_var, **entry_options)
+        self.minute_entry.grid(row=0, column=2, padx=(2, 4), pady=4)
+
+        step_frame = ctk.CTkFrame(self, width=28, height=50, fg_color="transparent")
+        step_frame.grid(row=0, column=3, padx=(0, 5), pady=3, sticky="ns")
+        step_frame.grid_propagate(False)
+        step_frame.grid_rowconfigure((0, 1), weight=1)
+        self.up_button = ctk.CTkButton(
+            step_frame,
+            text="▲",
+            width=26,
+            height=20,
+            corner_radius=5,
+            font=ctk.CTkFont(size=10),
+            command=lambda: self.adjust_active(1),
+        )
+        self.up_button.grid(row=0, column=0, pady=(0, 1), sticky="nsew")
+        self.down_button = ctk.CTkButton(
+            step_frame,
+            text="▼",
+            width=26,
+            height=20,
+            corner_radius=5,
+            font=ctk.CTkFont(size=10),
+            command=lambda: self.adjust_active(-1),
+        )
+        self.down_button.grid(row=1, column=0, pady=(1, 0), sticky="nsew")
+
+        self._trace_tokens = (
+            (self.hour_var, self.hour_var.trace_add("write", lambda *_: self._on_value_changed("hour"))),
+            (self.minute_var, self.minute_var.trace_add("write", lambda *_: self._on_value_changed("minute"))),
+        )
+        self._bind_entry(self.hour_entry, "hour")
+        self._bind_entry(self.minute_entry, "minute")
+        self.set_time(value)
+
+    def _bind_entry(self, entry, segment):
+        entry.bind("<FocusIn>", lambda _event, name=segment: self._set_active(name))
+        entry.bind("<FocusOut>", lambda _event, name=segment: self._pad_segment(name))
+        entry.bind("<KeyRelease>", lambda event, name=segment: self._on_key_release(event, name))
+        entry.bind("<Up>", lambda _event, name=segment: self._adjust_from_event(name, 1))
+        entry.bind("<Down>", lambda _event, name=segment: self._adjust_from_event(name, -1))
+        entry.bind("<Left>", lambda event, name=segment: self._move_between_segments(event, name, -1))
+        entry.bind("<Right>", lambda event, name=segment: self._move_between_segments(event, name, 1))
+        entry.bind("<MouseWheel>", lambda event, name=segment: self._on_mousewheel(event, name))
+        entry.bind("<<Paste>>", lambda _event, name=segment: self._on_paste(name))
+
+    def _set_active(self, segment):
+        self._active_segment = segment
+
+    def _set_var(self, variable, value):
+        self._updating = True
+        try:
+            variable.set(value)
+        finally:
+            self._updating = False
+
+    def _on_value_changed(self, segment):
+        if self._updating:
+            return
+        variable = self.hour_var if segment == "hour" else self.minute_var
+        raw_value = variable.get()
+        clean_value = "".join(character for character in raw_value if character.isdigit())[:2]
+        if clean_value != raw_value:
+            self._set_var(variable, clean_value)
+        self._notify_change()
+
+    def _on_key_release(self, event, segment):
+        if segment == "hour" and event.keysym.isdigit() and len(self.hour_var.get()) == 2:
+            self.focus_minute()
+
+    def _move_between_segments(self, event, segment, direction):
+        try:
+            cursor_index = event.widget.index("insert")
+            text_length = len(event.widget.get())
+        except Exception:
+            return None
+        if segment == "minute" and direction < 0 and cursor_index == 0:
+            self.focus_hour()
+            return "break"
+        if segment == "hour" and direction > 0 and cursor_index >= text_length:
+            self.focus_minute()
+            return "break"
+        return None
+
+    def _pad_segment(self, segment):
+        variable = self.hour_var if segment == "hour" else self.minute_var
+        value = variable.get()
+        if value and len(value) == 1:
+            self._set_var(variable, value.zfill(2))
+            self._notify_change()
+
+    def _adjust_from_event(self, segment, delta):
+        self._active_segment = segment
+        self.adjust_active(delta)
+        return "break"
+
+    def _on_mousewheel(self, event, segment):
+        delta = 1 if event.delta > 0 else -1
+        return self._adjust_from_event(segment, delta)
+
+    def _on_paste(self, segment):
+        try:
+            pasted = self.clipboard_get().strip()
+        except Exception:
+            return "break"
+
+        compact = pasted.replace(" ", "")
+        if ":" in compact or len(compact) in (4, 6):
+            self.set_time(compact)
+            return "break"
+
+        if compact.isdigit() and len(compact) <= 2:
+            limit = 23 if segment == "hour" else 59
+            number = int(compact)
+            if number <= limit:
+                variable = self.hour_var if segment == "hour" else self.minute_var
+                self._set_var(variable, f"{number:02d}")
+                self._notify_change()
+        return "break"
+
+    def adjust_active(self, delta):
+        segment = self._active_segment
+        variable = self.hour_var if segment == "hour" else self.minute_var
+        modulus = 24 if segment == "hour" else 60
+        raw_value = variable.get()
+        current = int(raw_value) if raw_value.isdigit() and int(raw_value) < modulus else 0
+        self._set_var(variable, f"{(current + delta) % modulus:02d}")
+        self._notify_change()
+        if segment == "hour":
+            self.focus_hour(select=False)
+        else:
+            self.focus_minute(select=False)
+
+    def focus_hour(self, select=True):
+        self._active_segment = "hour"
+        self.hour_entry.focus_set()
+        if select:
+            self.hour_entry.select_range(0, "end")
+
+    def focus_minute(self, select=True):
+        self._active_segment = "minute"
+        self.minute_entry.focus_set()
+        if select:
+            self.minute_entry.select_range(0, "end")
+
+    def set_time(self, value):
+        parsed = normalize_time_value(value)
+        self._updating = True
+        try:
+            if parsed is None:
+                self.hour_var.set("")
+                self.minute_var.set("")
+            else:
+                self.hour_var.set(f"{parsed[0]:02d}")
+                self.minute_var.set(f"{parsed[1]:02d}")
+        finally:
+            self._updating = False
+        self._notify_change()
+
+    def get_time(self):
+        hour_value = self.hour_var.get()
+        minute_value = self.minute_var.get()
+        if not hour_value or not minute_value:
+            return ""
+        try:
+            hour = int(hour_value)
+            minute = int(minute_value)
+        except ValueError:
+            return ""
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}:00"
+        return ""
+
+    def has_value(self):
+        return bool(self.hour_var.get() or self.minute_var.get())
+
+    def set_error(self, has_error):
+        self.configure(border_color=self._ERROR_BORDER if has_error else self._NORMAL_BORDER)
+
+    def _notify_change(self):
+        if self.command is not None:
+            self.after_idle(self.command)
+
+    def destroy(self):
+        for variable, token in self._trace_tokens:
+            try:
+                variable.trace_remove("write", token)
+            except Exception:
+                pass
+        super().destroy()
+
+
 class TimeModeDialog(TaskFlowWindow):
     def __init__(self, parent, callback, initial_data=None):
         super().__init__(parent)
         self.callback = callback
-        self.title("任务设置: 时间与模式")
+        self.title("设置播放时间")
+        self.geometry("440x520")
+        self.minsize(440, 520)
         self.resizable(False, False)
 
-        # 默认值
-        init_start = ""
-        init_mode = "song" # 'song' or 'duration'
-        init_end = ""
+        initial_data = initial_data or {}
+        init_start = initial_data.get("time", "")
+        init_mode = initial_data.get("mode", "song")
+        if init_mode not in ("song", "duration"):
+            init_mode = "song"
+        init_end = initial_data.get("end_time", "")
+        init_next_day = bool(initial_data.get("end_next_day", False))
 
-        if initial_data:
-            init_start = initial_data.get("time", "")
-            init_mode = initial_data.get("mode", "song")
-            init_end = initial_data.get("end_time", "")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, minsize=76)
 
-        # 1. 开始时间
-        ctk.CTkLabel(self, text="1. 设置开始时间", font=ctk.CTkFont(weight="bold")).pack(pady=(20, 5), anchor="w", padx=30)
-        self.start_entry = ctk.CTkEntry(self, width=200, placeholder_text="例如 1300 或 13:00")
-        self.start_entry.insert(0, init_start)
-        self.start_entry.pack(pady=5)
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.grid(row=0, column=0, sticky="nsew", padx=34, pady=(20, 0))
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(6, minsize=128)
 
-        # 2. 播放模式
-        ctk.CTkLabel(self, text="2. 选择播放模式", font=ctk.CTkFont(weight="bold")).pack(pady=(20, 5), anchor="w", padx=30)
+        ctk.CTkLabel(
+            content,
+            text="设置播放时间",
+            font=ctk.CTkFont(size=21, weight="bold"),
+            text_color="#1F6AA5",
+        ).grid(row=0, column=0, pady=(0, 14))
 
+        self.start_time_label = ctk.CTkLabel(
+            content,
+            text="开始时间",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.start_time_label.grid(row=1, column=0, sticky="w")
+        self.start_input = TimeSpinInput(content, value=init_start, command=self.validate_form)
+        self.start_input.grid(row=2, column=0, pady=(7, 17))
+
+        ctk.CTkLabel(content, text="播放行为", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=3, column=0, sticky="w", pady=(0, 4)
+        )
         self.mode_var = ctk.StringVar(value=init_mode)
+        self.radio_song = ctk.CTkRadioButton(
+            content,
+            text="播放所选歌曲，播完后停止",
+            variable=self.mode_var,
+            value="song",
+            command=self.toggle_mode,
+        )
+        self.radio_song.grid(row=4, column=0, sticky="w", padx=14, pady=(4, 6))
+        self.radio_duration = ctk.CTkRadioButton(
+            content,
+            text="循环播放，到指定时间停止",
+            variable=self.mode_var,
+            value="duration",
+            command=self.toggle_mode,
+        )
+        self.radio_duration.grid(row=5, column=0, sticky="w", padx=14)
 
-        self.radio_song = ctk.CTkRadioButton(self, text="模式一：固定曲目 (播完即止)", variable=self.mode_var, value="song", command=self.toggle_mode)
-        self.radio_song.pack(pady=5, anchor="w", padx=50)
+        self.end_time_frame = ctk.CTkFrame(content, fg_color="transparent")
+        self.end_time_frame.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
+        self.end_time_frame.grid_columnconfigure(0, weight=1)
+        self.end_time_label = ctk.CTkLabel(
+            self.end_time_frame,
+            text="结束时间",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.end_time_label.grid(row=0, column=0, sticky="w")
 
-        self.radio_duration = ctk.CTkRadioButton(self, text="模式二：固定时长 (循环/截断)", variable=self.mode_var, value="duration", command=self.toggle_mode)
-        self.radio_duration.pack(pady=5, anchor="w", padx=50)
+        end_controls = ctk.CTkFrame(self.end_time_frame, fg_color="transparent")
+        end_controls.grid(row=1, column=0, pady=(7, 0))
+        self.end_input = TimeSpinInput(end_controls, value=init_end, command=self.validate_form)
+        self.end_input.grid(row=0, column=0)
+        self.next_day_var = ctk.BooleanVar(value=init_next_day)
+        self.next_day_checkbox = ctk.CTkCheckBox(
+            end_controls,
+            text="次日结束",
+            variable=self.next_day_var,
+            command=self.validate_form,
+            width=100,
+        )
+        self.next_day_checkbox.grid(row=1, column=0, sticky="w", pady=(7, 0))
 
-        # 3. 结束时间 (仅模式二) - 使用 Frame 包裹以便整体隐藏
-        self.end_time_frame = ctk.CTkFrame(self, fg_color="transparent")
-        # 初始不 pack，由 toggle_mode 决定
+        self.feedback_label = ctk.CTkLabel(
+            content,
+            text="",
+            height=40,
+            wraplength=360,
+            justify="left",
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+        )
+        self.feedback_label.grid(row=7, column=0, sticky="ew", pady=(4, 0))
 
-        ctk.CTkLabel(self.end_time_frame, text="结束时间:", text_color="#1F6AA5", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=(50, 10))
-        self.end_entry = ctk.CTkEntry(self.end_time_frame, width=120, placeholder_text="例如 13:40")
-        self.end_entry.insert(0, init_end)
-        self.end_entry.pack(side="left")
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=1, column=0, sticky="nsew", padx=34, pady=(7, 18))
+        footer.grid_columnconfigure(0, weight=1)
+        self.cancel_button = ctk.CTkButton(
+            footer,
+            text="取消",
+            command=self.destroy,
+            width=96,
+            height=42,
+            corner_radius=21,
+            fg_color="transparent",
+            border_width=2,
+            text_color="gray",
+        )
+        self.cancel_button.grid(row=0, column=0, sticky="w")
+        self.next_button = ctk.CTkButton(
+            footer,
+            text="下一步",
+            command=self.on_confirm,
+            width=126,
+            height=42,
+            corner_radius=21,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            state="disabled",
+        )
+        self.next_button.grid(row=0, column=1, sticky="e")
 
-        # 底部按钮
-        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.btn_frame.pack(side="bottom", pady=20)
-        ctk.CTkButton(self.btn_frame, text="下一步", command=self.on_confirm, width=120).pack(side="left", padx=10)
-        ctk.CTkButton(self.btn_frame, text="取消", command=self.destroy, fg_color="transparent", border_width=1, text_color="gray", width=80).pack(side="left", padx=10)
-
-        # 初始化显示状态
+        self.bind("<Return>", self._on_return)
         self.toggle_mode()
+        self.after(50, self.start_input.focus_hour)
 
     def toggle_mode(self):
         if self.mode_var.get() == "duration":
-            # 模式二：显示结束时间输入框，窗口变高
-            self.end_time_frame.pack(pady=10, fill="x", before=self.btn_frame)
-            self.geometry("400x420")
+            self.end_time_frame.grid()
         else:
-            # 模式一：隐藏结束时间输入框，窗口变矮
-            self.end_time_frame.pack_forget()
-            self.geometry("400x340")
+            self.end_time_frame.grid_remove()
+        self.validate_form()
 
-    def parse_time(self, t_input):
-        t_clean = t_input.strip().replace("：", ":").replace(" ", "")
-        candidate = ""
-        if ":" in t_clean:
-            parts = t_clean.split(":")
-            if len(parts) == 2: parts.append("00")
-            if len(parts) == 3: candidate = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
-        else:
-            if len(t_clean) <= 2: candidate = f"{t_clean.zfill(2)}:00:00"
-            elif len(t_clean) == 4: candidate = f"{t_clean[:2]}:{t_clean[2:]}:00"
-            elif len(t_clean) == 6: candidate = f"{t_clean[:2]}:{t_clean[2:4]}:{t_clean[4:]}"
+    def validate_form(self):
+        if not self.winfo_exists():
+            return False
+        start_time = self.start_input.get_time()
+        mode = self.mode_var.get()
+        end_time = self.end_input.get_time() if mode == "duration" else ""
+        next_day = bool(self.next_day_var.get()) if mode == "duration" else False
 
-        if candidate:
-            try:
-                datetime.strptime(candidate, "%H:%M:%S")
-                return candidate
-            except ValueError:
-                return None
-        return None
+        start_error = self.start_input.has_value() and not bool(start_time)
+        end_error = mode == "duration" and self.end_input.has_value() and not bool(end_time)
+        message = "请选择开始时间"
+        message_kind = "hint"
+        valid = False
 
-    def show_alert(self, msg):
-        top = DpiStableToplevel(self)
-        top.geometry("250x150")
-        top.attributes("-topmost", True)
-        ctk.CTkLabel(top, text=msg, wraplength=220).pack(expand=True)
-        ctk.CTkButton(top, text="OK", command=top.destroy).pack(pady=10)
+        if not start_time and self.start_input.has_value():
+            message = "请完整输入有效的开始时间（00:00 至 23:59）"
+            message_kind = "error"
+        elif start_time:
+            start_display = format_clock_for_display(start_time)
+            if mode == "song":
+                message = f"将在 {start_display} 开始，所选歌曲播完后停止"
+                message_kind = "valid"
+                valid = True
+            elif not end_time:
+                if self.end_input.has_value():
+                    message = "请完整输入有效的结束时间（00:00 至 23:59）"
+                    message_kind = "error"
+                else:
+                    message = "请选择结束时间"
+            elif not next_day and end_time <= start_time:
+                message = "结束时间不晚于开始时间；如需跨午夜，请勾选“次日结束”"
+                message_kind = "error"
+                end_error = True
+            else:
+                end_display = format_clock_for_display(end_time)
+                end_target = f"次日 {end_display}" if next_day else end_display
+                message = f"将在 {start_display} 开始，循环播放至{end_target}"
+                message_kind = "valid"
+                valid = True
+
+        self.start_input.set_error(start_error)
+        self.end_input.set_error(end_error)
+        self.feedback_label.configure(
+            text=message,
+            text_color={
+                "hint": "gray",
+                "error": "#D13438",
+                "valid": "#1F6AA5",
+            }[message_kind],
+        )
+        self.next_button.configure(state="normal" if valid else "disabled")
+        return valid
+
+    def _on_return(self, _event=None):
+        if self.validate_form():
+            self.on_confirm()
+        return "break"
 
     def on_confirm(self):
-        start_t = self.parse_time(self.start_entry.get())
-        if not start_t:
-            self.show_alert("开始时间格式错误\n请输入如 1300 或 13:00")
+        if not self.validate_form():
             return
 
         mode = self.mode_var.get()
-        end_t = ""
-
-        if mode == "duration":
-            end_t = self.parse_time(self.end_entry.get())
-            if not end_t:
-                self.show_alert("结束时间格式错误\n请输入如 1340 或 13:40")
-                return
-            if end_t <= start_t:
-                self.show_alert("结束时间必须晚于开始时间")
-                return
-        else:
-            # 模式一：强制清空结束时间，确保不保存脏数据
-            end_t = ""
-
         callback = self.callback
         config_data = {
-            "time": start_t,
+            "time": self.start_input.get_time(),
             "mode": mode,
-            "end_time": end_t
+            "end_time": self.end_input.get_time() if mode == "duration" else "",
+            "end_next_day": bool(self.next_day_var.get()) if mode == "duration" else False,
         }
         self.destroy()
         callback(config_data)
@@ -649,5 +1019,8 @@ __all__ = [
     "TaskRenameDialog",
     "WeekdaySelectionDialog",
     "MultiSongSelectDialog",
+    "TimeSpinInput",
     "TimeModeDialog",
+    "normalize_time_value",
+    "format_clock_for_display",
 ]
