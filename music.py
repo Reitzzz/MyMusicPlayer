@@ -7,6 +7,7 @@ import pygame
 import winreg
 import json
 import ctypes
+import copy
 from datetime import datetime, timedelta
 from pathlib import Path
 import pystray
@@ -158,17 +159,44 @@ class MusicSchedulerApp(DpiStableCTk):
 
     # --- 持久化存储 ---
     def save_tasks(self):
+        tasks_path = Path(TASKS_FILE)
+        temp_path = tasks_path.with_name(f"{tasks_path.name}.tmp")
         try:
+            tasks_to_save = []
             for task in self.tasks:
-                task["files"] = [
+                saved_task = dict(task)
+                saved_task["files"] = [
                     make_portable_music_path(path)
                     for path in task.get("files", [])
                 ]
-            with open(TASKS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.tasks, f, ensure_ascii=False, indent=2)
-            self.status_label.configure(text="设置已保存", text_color="green")
+                tasks_to_save.append(saved_task)
+
+            with temp_path.open('w', encoding='utf-8') as f:
+                json.dump(tasks_to_save, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, tasks_path)
+            return True
         except Exception as e:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             self.status_label.configure(text=f"保存失败: {e}", text_color="red")
+            self.show_error_alert(
+                "任务设置未能保存，请检查程序目录的写入权限或磁盘空间。",
+                title="保存失败",
+                detail=str(e),
+            )
+            return False
+
+    def _save_tasks_or_restore(self, previous_tasks):
+        """保存当前任务；失败时恢复修改前的任务和界面。"""
+        if self.save_tasks():
+            return True
+        self.tasks = previous_tasks
+        self.refresh_task_list()
+        return False
 
     def load_tasks(self):
         # 由于已经在开头强制切换了工作目录，这里直接读取文件名即可
@@ -189,15 +217,21 @@ class MusicSchedulerApp(DpiStableCTk):
             # 如果文件不存在，说明是新环境或没保存过
             self.status_label.configure(text="无历史任务记录", text_color="gray")
 
-    def show_error_alert(self, msg):
+    def show_error_alert(self, msg, *, title="操作提示", detail=None):
+        detail_text = " ".join(str(detail).split()) if detail else ""
+        if len(detail_text) > 180:
+            detail_text = f"{detail_text[:177]}..."
+
+        width = 360 if detail_text else 320
+        height = 230 if detail_text else 180
         err_win = DpiStableToplevel(self)
-        err_win.title("操作提示")
-        err_win.geometry("320x180")
+        err_win.title(title)
+        err_win.geometry(f"{width}x{height}")
         err_win.resizable(False, False)
         err_win.attributes("-topmost", True)
         err_win.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() // 2) - 160
-        y = self.winfo_y() + (self.winfo_height() // 2) - 90
+        x = self.winfo_x() + (self.winfo_width() // 2) - (width // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (height // 2)
         if x < 0: x = 100
         if y < 0: y = 100
         err_win.geometry(f"+{x}+{y}")
@@ -206,7 +240,16 @@ class MusicSchedulerApp(DpiStableCTk):
 
         ctk.CTkLabel(err_win, text="⚠️", font=ctk.CTkFont(size=40)).pack(pady=(15, 0))
         ctk.CTkLabel(err_win, text=msg, font=ctk.CTkFont(size=14), text_color="#CC0000", 
-                     wraplength=280, justify="center").pack(expand=True, padx=10, pady=5)
+                     wraplength=width - 40, justify="center").pack(expand=True, padx=10, pady=5)
+        if detail_text:
+            ctk.CTkLabel(
+                err_win,
+                text=f"详细信息: {detail_text}",
+                font=ctk.CTkFont(size=11),
+                text_color="gray",
+                wraplength=width - 40,
+                justify="left",
+            ).pack(fill="x", padx=20, pady=(0, 8))
         
         ctk.CTkButton(err_win, text="确定", command=err_win.destroy, 
                       width=100, fg_color="#CC0000", hover_color="#990000").pack(pady=(0, 20))
@@ -425,15 +468,6 @@ class MusicSchedulerApp(DpiStableCTk):
                     help_win.protocol("WM_DELETE_WINDOW", help_win.destroy)
             help_win.after(1000, update_countdown)
 
-    def show_startup_error(self, error_msg):
-        err_win = DpiStableToplevel(self)
-        err_win.title("设置失败")
-        err_win.geometry("300x200")
-        err_win.attributes("-topmost", True)
-        ctk.CTkLabel(err_win, text="无法开启开机自启", font=ctk.CTkFont(size=16, weight="bold"), text_color="red").pack(pady=20)
-        ctk.CTkLabel(err_win, text="可能被杀毒软件拦截\n请手动添加白名单", text_color="gray").pack()
-        ctk.CTkButton(err_win, text="确定", width=80, command=err_win.destroy).pack(pady=20)
-
     # --- 开机自启逻辑 ---
     def get_startup_command(self):
         """返回当前程序位置对应的开机启动命令。"""
@@ -490,7 +524,11 @@ class MusicSchedulerApp(DpiStableCTk):
         except Exception as e:
             self.auto_start_var.set(False)
             self.status_label.configure(text="设置自启失败", text_color="red")
-            self.show_startup_error(str(e))
+            self.show_error_alert(
+                "无法开启开机自启，可能被安全软件拦截。请检查权限或添加白名单。",
+                title="设置失败",
+                detail=str(e),
+            )
 
     def load_music_files(self):
         self.music_files = []
@@ -667,6 +705,7 @@ class MusicSchedulerApp(DpiStableCTk):
             )
 
     def finalize_add_task(self, config, f_list, display_name, weekdays_indices):
+        previous_tasks = copy.deepcopy(self.tasks)
         self.tasks.append({
             "time": config['time'], 
             "mode": config['mode'],
@@ -677,7 +716,8 @@ class MusicSchedulerApp(DpiStableCTk):
             "weekdays": weekdays_indices,
             "enabled": True  # 默认开启
         })
-        self.save_tasks() # 保存
+        if not self._save_tasks_or_restore(previous_tasks):
+            return
         self.refresh_task_list()
         self.status_label.configure(text=f"成功添加任务: {display_name}", text_color="green")
 
@@ -706,6 +746,7 @@ class MusicSchedulerApp(DpiStableCTk):
         if not self.ensure_edit_task_available(edit_task):
             return
 
+        previous_tasks = copy.deepcopy(self.tasks)
         edit_task['time'] = config['time']
         edit_task['mode'] = config['mode']
         edit_task['end_time'] = config['end_time']
@@ -716,16 +757,19 @@ class MusicSchedulerApp(DpiStableCTk):
         # 保持原有的启用/禁用状态，如果没有则默认为 True
         edit_task['enabled'] = edit_task.get('enabled', True)
         
-        self.save_tasks() # 保存
+        if not self._save_tasks_or_restore(previous_tasks):
+            return
         self.refresh_task_list()
         self.status_label.configure(text=f"任务修改成功: {display_name}", text_color="green")
 
     # --- 任务启用/禁用逻辑 ---
     def toggle_task_enabled(self, index, switch_var):
         if 0 <= index < len(self.tasks):
+            previous_tasks = copy.deepcopy(self.tasks)
             new_state = bool(switch_var.get())
             self.tasks[index]["enabled"] = new_state
-            self.save_tasks()
+            if not self._save_tasks_or_restore(previous_tasks):
+                return
             state_str = "启用" if new_state else "禁用"
             self.status_label.configure(text=f"已{state_str}任务: {self.tasks[index]['name']}", text_color="#1F6AA5")
 
@@ -790,9 +834,15 @@ class MusicSchedulerApp(DpiStableCTk):
 
     def delete_task(self, index):
         if 0 <= index < len(self.tasks):
-            del self.tasks[index]
-            self.save_tasks() # 保存
+            previous_tasks = copy.deepcopy(self.tasks)
+            deleted_task = self.tasks.pop(index)
+            if not self._save_tasks_or_restore(previous_tasks):
+                return
             self.refresh_task_list()
+            self.status_label.configure(
+                text=f"已删除任务: {deleted_task.get('name', '未命名任务')}",
+                text_color="green"
+            )
 
     def start_playlist(self, task):
         self.playlist_queue = list(task.get("files", []))
