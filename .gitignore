@@ -7,3 +7,6 @@ __pycache__/
 *.toc
 *.pkg
 .idea/
+tests/.tmp/*
+!tests/.tmp/.gitkeep
+tasks.corrupt-*.json

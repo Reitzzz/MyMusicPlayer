@@ -8,6 +8,7 @@ import winreg
 import json
 import ctypes
 import copy
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 import pystray
@@ -45,7 +46,9 @@ ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 TASKS_FILE = "tasks.json"
 APPLICATION_DIR = Path(application_path).resolve()
+TASKS_PATH = APPLICATION_DIR / TASKS_FILE
 MUSIC_DIRECTORIES = ("mp3", "changyong")
+SCHEDULE_GRACE_SECONDS = 90
 
 
 def resolve_music_path(path_value):
@@ -102,7 +105,7 @@ class MusicSchedulerApp(DpiStableCTk):
 
         self.title("音乐定时播放系统 Pro")
         self.geometry("1000x750")
-        
+
         # 修复：获取参数前也需要确保工作目录，已在文件头处理
         if "--silent" in sys.argv:
             self.withdraw()
@@ -120,8 +123,12 @@ class MusicSchedulerApp(DpiStableCTk):
         self.grid_rowconfigure(0, weight=1)
 
         self.tasks = []
+        self._tasks_load_state = "pending"
+        self._tasks_backup_path = None
         self.music_files = []
         self.active_task_dialog = None
+        self._help_win = None
+        self._help_win_forced = False
         
         # 播放状态变量
         self.playlist_queue = []      
@@ -134,9 +141,12 @@ class MusicSchedulerApp(DpiStableCTk):
         # 主循环与跨线程事件状态
         self.running = True
         self._closing = False
-        self.last_trigger_date = None
-        self.triggered_tasks = set()
+        self.last_tick_dt = None
         self.ui_event_queue = queue.Queue()
+        self.tray_icon = None
+        self.tray_thread = None
+        self._tray_unavailable = False
+        self._tray_alert_shown = False
         
         self.auto_start_var = ctk.BooleanVar(value=False)
 
@@ -158,8 +168,166 @@ class MusicSchedulerApp(DpiStableCTk):
         self.after(500, self.check_first_run)
 
     # --- 持久化存储 ---
+    def _set_tasks_load_state(self, state):
+        """更新任务存储状态，并同步任务编辑入口。"""
+        if state not in {"pending", "ready", "failed"}:
+            raise ValueError(f"未知任务加载状态: {state}")
+        self._tasks_load_state = state
+        create_button = getattr(self, "create_task_btn", None)
+        if create_button is not None:
+            try:
+                create_button.configure(state="normal" if state == "ready" else "disabled")
+            except Exception:
+                pass
+
+    def _tasks_are_writable(self):
+        return getattr(self, "_tasks_load_state", "pending") == "ready"
+
+    def _warn_tasks_read_only(self):
+        state = getattr(self, "_tasks_load_state", "pending")
+        if state == "pending":
+            message = "任务数据仍在加载，请稍后再试"
+            detail = None
+        else:
+            message = "任务文件读取失败，本次运行已进入只读保护"
+            backup_path = getattr(self, "_tasks_backup_path", None)
+            detail = (
+                f"原文件备份为 {Path(backup_path).name}，请修复 tasks.json 后重启程序。"
+                if backup_path
+                else "原文件未被覆盖，请检查 tasks.json 后重启程序。"
+            )
+        self.status_label.configure(text=message, text_color="red")
+        self.show_error_alert(message, title="任务数据只读", detail=detail)
+
+    def _backup_tasks_file(self, tasks_path):
+        """复制原始任务文件到唯一的损坏备份，不改动源文件。"""
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = tasks_path.with_name(
+            f"{tasks_path.stem}.corrupt-{timestamp}{tasks_path.suffix}"
+        )
+        counter = 1
+        while backup_path.exists():
+            backup_path = tasks_path.with_name(
+                f"{tasks_path.stem}.corrupt-{timestamp}-{counter}{tasks_path.suffix}"
+            )
+            counter += 1
+        try:
+            shutil.copy2(tasks_path, backup_path)
+        except Exception:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        self._tasks_backup_path = backup_path
+        return backup_path
+
+    @staticmethod
+    def _is_valid_clock(value):
+        if not isinstance(value, str):
+            return False
+        try:
+            parsed = datetime.strptime(value, "%H:%M:%S")
+        except ValueError:
+            return False
+        return parsed.strftime("%H:%M:%S") == value
+
+    def _sanitize_task(self, raw_task):
+        """返回 (净化任务或 None, 有损修正数)。
+
+        只有真正丢失信息才计入有损修正：丢弃条目，或把"显式存在但非法"的值
+        替换为默认值。无损归一化不计入，避免旧格式任务每次启动都被判为损坏：
+        缺失字段补默认值、音频路径便携化、任务名去除首尾空白。
+        """
+        if not isinstance(raw_task, dict):
+            return None, 1
+
+        task = dict(raw_task)
+        lossy = 0
+
+        time_value = raw_task.get("time")
+        if not self._is_valid_clock(time_value):
+            return None, 1
+        task["time"] = time_value
+
+        raw_weekdays = raw_task.get("weekdays", [])
+        weekdays = []
+        if isinstance(raw_weekdays, list):
+            for day in raw_weekdays:
+                if (
+                    isinstance(day, int)
+                    and not isinstance(day, bool)
+                    and 0 <= day <= 6
+                    and day not in weekdays
+                ):
+                    weekdays.append(day)
+            if len(weekdays) != len(raw_weekdays):
+                lossy += 1
+        elif "weekdays" in raw_task:
+            lossy += 1
+        task["weekdays"] = weekdays
+
+        raw_name = raw_task.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            name = raw_name.strip()
+        else:
+            name = "未命名任务"
+            if "name" in raw_task:
+                lossy += 1
+        task["name"] = name
+
+        raw_files = raw_task.get("files", [])
+        files = []
+        if isinstance(raw_files, list):
+            for path_value in raw_files:
+                if not isinstance(path_value, str) or not path_value.strip():
+                    continue
+                try:
+                    files.append(make_portable_music_path(path_value))
+                except Exception:
+                    continue
+            if len(files) != len(raw_files):
+                lossy += 1
+        elif "files" in raw_task:
+            lossy += 1
+        task["files"] = files
+
+        raw_mode = raw_task.get("mode", "song")
+        mode = raw_mode if raw_mode in {"song", "duration"} else "song"
+        if "mode" in raw_task and raw_mode != mode:
+            lossy += 1
+        task["mode"] = mode
+
+        raw_end_time = raw_task.get("end_time", "")
+        if mode == "duration":
+            if not self._is_valid_clock(raw_end_time):
+                return None, lossy + 1
+            end_time = raw_end_time
+        else:
+            end_time = raw_end_time if isinstance(raw_end_time, str) else ""
+            if "end_time" in raw_task and raw_end_time != end_time:
+                lossy += 1
+        task["end_time"] = end_time
+
+        raw_end_next_day = raw_task.get("end_next_day", False)
+        end_next_day = raw_end_next_day if isinstance(raw_end_next_day, bool) else False
+        if "end_next_day" in raw_task and raw_end_next_day != end_next_day:
+            lossy += 1
+        task["end_next_day"] = end_next_day
+
+        raw_enabled = raw_task.get("enabled", True)
+        enabled = raw_enabled if isinstance(raw_enabled, bool) else False
+        if "enabled" in raw_task and raw_enabled != enabled:
+            lossy += 1
+        task["enabled"] = enabled
+        return task, lossy
+
     def save_tasks(self):
-        tasks_path = Path(TASKS_FILE)
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return False
+
+        tasks_path = Path(TASKS_PATH)
         temp_path = tasks_path.with_name(f"{tasks_path.name}.tmp")
         try:
             tasks_to_save = []
@@ -199,23 +367,97 @@ class MusicSchedulerApp(DpiStableCTk):
         return False
 
     def load_tasks(self):
-        # 由于已经在开头强制切换了工作目录，这里直接读取文件名即可
-        if os.path.exists(TASKS_FILE):
-            try:
-                with open(TASKS_FILE, 'r', encoding='utf-8') as f:
-                    self.tasks = json.load(f)
-                for task in self.tasks:
-                    task["files"] = [
-                        make_portable_music_path(path)
-                        for path in task.get("files", [])
-                    ]
-                self.refresh_task_list()
-                self.status_label.configure(text=f"已加载 {len(self.tasks)} 个任务", text_color="gray")
-            except Exception as e:
-                self.status_label.configure(text=f"读取任务失败: {e}", text_color="red")
-        else:
-            # 如果文件不存在，说明是新环境或没保存过
+        tasks_path = Path(TASKS_PATH)
+        self._tasks_backup_path = None
+        self._set_tasks_load_state("pending")
+
+        if not tasks_path.exists():
+            self.tasks = []
+            self._set_tasks_load_state("ready")
+            self.refresh_task_list()
             self.status_label.configure(text="无历史任务记录", text_color="gray")
+            return
+
+        try:
+            with tasks_path.open('r', encoding='utf-8-sig') as f:
+                loaded_data = json.load(f)
+            if not isinstance(loaded_data, list):
+                raise ValueError("tasks.json 顶层必须是任务列表")
+        except Exception as e:
+            backup_error = None
+            try:
+                backup_path = self._backup_tasks_file(tasks_path)
+            except Exception as backup_exception:
+                backup_path = None
+                backup_error = backup_exception
+
+            self.tasks = []
+            self._set_tasks_load_state("failed")
+            self.refresh_task_list()
+            if backup_path is not None:
+                detail = f"原文件已备份为 {backup_path.name}。请修复 tasks.json 后重启程序。"
+            else:
+                detail = f"原文件未被覆盖，但自动备份失败：{backup_error}"
+            self.status_label.configure(text=f"读取任务失败: {e}", text_color="red")
+            self.show_error_alert(
+                "任务文件无法读取，本次运行已进入只读保护。",
+                title="读取任务失败",
+                detail=detail,
+            )
+            return
+
+        sanitized_tasks = []
+        skipped_count = 0
+        lossy_count = 0
+        for raw_task in loaded_data:
+            task, lossy = self._sanitize_task(raw_task)
+            if task is None:
+                skipped_count += 1
+                continue
+            sanitized_tasks.append(task)
+            lossy_count += lossy
+
+        needs_backup = skipped_count > 0 or lossy_count > 0
+        backup_path = None
+        backup_error = None
+        if needs_backup:
+            try:
+                backup_path = self._backup_tasks_file(tasks_path)
+            except Exception as e:
+                backup_error = e
+
+        self.tasks = sanitized_tasks
+        self._set_tasks_load_state(
+            "ready" if not needs_backup or backup_path is not None else "failed"
+        )
+        self.refresh_task_list()
+
+        if needs_backup and backup_path is not None:
+            message = (
+                f"已加载 {len(self.tasks)} 个任务，跳过 {skipped_count} 个，"
+                f"修正 {lossy_count} 个字段"
+            )
+            self.status_label.configure(text=message, text_color="orange")
+            self.show_error_alert(
+                "任务文件中存在无效数据，已保留可用任务。",
+                title="任务数据已修复",
+                detail=f"原文件已备份为 {backup_path.name}。",
+            )
+        elif needs_backup:
+            self.status_label.configure(
+                text="任务数据存在问题且备份失败，已进入只读保护",
+                text_color="red",
+            )
+            self.show_error_alert(
+                "任务文件包含无效数据，自动备份失败，本次运行仅可查看。",
+                title="任务数据只读",
+                detail=str(backup_error),
+            )
+        else:
+            self.status_label.configure(
+                text=f"已加载 {len(self.tasks)} 个任务",
+                text_color="gray",
+            )
 
     def show_error_alert(self, msg, *, title="操作提示", detail=None):
         detail_text = " ".join(str(detail).split()) if detail else ""
@@ -265,14 +507,63 @@ class MusicSchedulerApp(DpiStableCTk):
         return image
 
     def setup_tray_icon(self):
-        menu = (
-            pystray.MenuItem('显示窗口', self.show_window_from_tray, default=True),
-            pystray.MenuItem('退出程序', self.quit_app_from_tray)
+        try:
+            menu = (
+                pystray.MenuItem('显示窗口', self.show_window_from_tray, default=True),
+                pystray.MenuItem('退出程序', self.quit_app_from_tray)
+            )
+            icon_image = self.create_tray_image()
+            self.tray_icon = pystray.Icon("MusicScheduler", icon_image, "定时播放器", menu)
+            self.tray_thread = threading.Thread(target=self._run_tray_icon, daemon=True)
+            self.tray_thread.start()
+        except Exception as e:
+            self.tray_icon = None
+            self.tray_thread = None
+            self._handle_tray_failure(e)
+
+    def _run_tray_icon(self):
+        """运行托盘循环，并将线程内错误交回 Tk 主线程。"""
+        icon = self.tray_icon
+        if icon is None:
+            return
+        try:
+            icon.run()
+        except Exception as e:
+            self.ui_event_queue.put(("tray_failed", str(e)))
+        else:
+            if self.running and not self._closing:
+                self.ui_event_queue.put(("tray_failed", "托盘线程意外停止"))
+
+    def _handle_tray_failure(self, detail=None):
+        """在 Tk 主线程中降级为无托盘模式。"""
+        self.tray_icon = None
+        self.tray_thread = None
+        self._tray_unavailable = True
+        self.deiconify()
+        self.lift()
+        # 延后提示：同步失败发生在 __init__ 内，若立即写状态栏会被随后的
+        # load_tasks 覆盖；延后同时保证弹窗在主循环内创建。
+        self.after(300, lambda: self._announce_tray_unavailable(detail))
+
+    def _announce_tray_unavailable(self, detail=None):
+        """重申托盘不可用状态，并只弹一次告警。"""
+        if not self._tray_unavailable:
+            return
+        try:
+            self.status_label.configure(
+                text="系统托盘不可用，关闭窗口将直接退出",
+                text_color="orange",
+            )
+        except Exception:
+            pass
+        if self._tray_alert_shown:
+            return
+        self._tray_alert_shown = True
+        self.show_error_alert(
+            "系统托盘不可用，程序将以窗口模式运行；关闭主窗口会直接退出。",
+            title="系统托盘不可用",
+            detail=detail,
         )
-        icon_image = self.create_tray_image()
-        self.tray_icon = pystray.Icon("MusicScheduler", icon_image, "定时播放器", menu)
-        self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
-        self.tray_thread.start()
 
     def show_window_from_tray(self, icon=None, item=None):
         self.ui_event_queue.put("show")
@@ -284,13 +575,21 @@ class MusicSchedulerApp(DpiStableCTk):
         """在 Tk 主线程中处理来自托盘线程的窗口操作。"""
         try:
             while True:
-                action = self.ui_event_queue.get_nowait()
+                event = self.ui_event_queue.get_nowait()
+                if isinstance(event, tuple):
+                    action = event[0]
+                    detail = event[1] if len(event) > 1 else None
+                else:
+                    action = event
+                    detail = None
                 if action == "show":
                     self.deiconify()
                     self.lift()
                 elif action == "quit":
                     self.on_real_close()
                     return
+                elif action == "tray_failed":
+                    self._handle_tray_failure(detail)
         except queue.Empty:
             pass
 
@@ -298,7 +597,10 @@ class MusicSchedulerApp(DpiStableCTk):
             self.after(50, self.process_ui_events)
 
     def on_close(self):
-        self.withdraw()
+        if self.tray_icon is None:
+            self.on_real_close()
+        else:
+            self.withdraw()
 
     def on_real_close(self):
         if self._closing:
@@ -306,8 +608,22 @@ class MusicSchedulerApp(DpiStableCTk):
 
         self._closing = True
         self.running = False
+        tray_icon = self.tray_icon
+        tray_thread = self.tray_thread
+        self.tray_icon = None
+        self.tray_thread = None
         try:
-            self.tray_icon.stop()
+            if tray_icon is not None:
+                tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            if (
+                tray_thread is not None
+                and tray_thread is not threading.current_thread()
+                and tray_thread.is_alive()
+            ):
+                tray_thread.join(timeout=2.0)
         except Exception:
             pass
         try:
@@ -373,10 +689,17 @@ class MusicSchedulerApp(DpiStableCTk):
         # 将原来的输入框逻辑替换为一个“创建新任务”的大按钮
         ctk.CTkLabel(input_frame, text="任务管理:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=20)
         
-        create_task_btn = ctk.CTkButton(input_frame, text="+ 创建新任务", width=150, height=35,
-                                        fg_color="#1F6AA5", font=ctk.CTkFont(weight="bold"),
-                                        command=self.initiate_add_task_flow)
-        create_task_btn.pack(side="left", padx=10, pady=15)
+        self.create_task_btn = ctk.CTkButton(
+            input_frame,
+            text="+ 创建新任务",
+            width=150,
+            height=35,
+            fg_color="#1F6AA5",
+            font=ctk.CTkFont(weight="bold"),
+            command=self.initiate_add_task_flow,
+            state="disabled",
+        )
+        self.create_task_btn.pack(side="left", padx=10, pady=15)
         
         ctk.CTkLabel(input_frame, text="支持: 固定歌曲播放 / 固定时长播放", text_color="gray", font=ctk.CTkFont(size=12)).pack(side="right", padx=20)
 
@@ -408,13 +731,59 @@ class MusicSchedulerApp(DpiStableCTk):
                 pass
 
     def show_help_window(self, forced_countdown=False):
+        existing = getattr(self, "_help_win", None)
+        existing_alive = False
+        if existing is not None:
+            try:
+                existing_alive = bool(existing.winfo_exists())
+            except Exception:
+                existing_alive = False
+
+        if existing_alive:
+            if forced_countdown and not getattr(self, "_help_win_forced", False):
+                try:
+                    existing.destroy()
+                except Exception:
+                    pass
+            else:
+                try:
+                    existing.lift()
+                    existing.focus_force()
+                except Exception:
+                    pass
+                return
+
         help_win = DpiStableToplevel(self)
+        self._help_win = help_win
+        self._help_win_forced = bool(forced_countdown)
         help_win.title("使用说明")
         help_win.geometry("480x550") 
         help_win.attributes("-topmost", True)
-        
+
+        def clear_help_reference(event=None):
+            if event is not None and getattr(event, "widget", help_win) is not help_win:
+                return
+            if getattr(self, "_help_win", None) is help_win:
+                self._help_win = None
+                self._help_win_forced = False
+
+        def close_help_window():
+            clear_help_reference()
+            try:
+                if help_win.winfo_exists():
+                    help_win.destroy()
+            except Exception:
+                pass
+
+        try:
+            help_win.bind("<Destroy>", clear_help_reference, add="+")
+        except Exception:
+            pass
+
         if forced_countdown:
             help_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        else:
+            help_win.protocol("WM_DELETE_WINDOW", close_help_window)
         
         ctk.CTkLabel(help_win, text="使用说明", font=ctk.CTkFont(size=20, weight="bold"), text_color="#1F6AA5").pack(pady=(20, 10))
         
@@ -437,8 +806,8 @@ class MusicSchedulerApp(DpiStableCTk):
             "   播放星期和名称。\n\n"
             "4. 【托盘与注意事项】\n"
             "   普通启动会显示主窗口；开机自启会静默启动并显示托盘图标。\n"
-            "   点击右上角关闭按钮会隐藏窗口；请在托盘菜单中选择“退出程序”\n"
-            "   才能彻底退出。\n"
+            "   托盘正常时，点击右上角关闭按钮会隐藏窗口；请在托盘菜单中\n"
+            "   选择“退出程序”才能彻底退出。托盘不可用时关闭窗口会直接退出。\n"
             "   - 支持格式：mp3, flac, wav, ogg, m4a, wma, aac\n"
             "   - 请务必禁用电脑自动休眠，以免影响播放"
         )
@@ -453,19 +822,37 @@ class MusicSchedulerApp(DpiStableCTk):
             btn_text = "请阅读 (10s)"
             btn_state = "disabled"
 
-        self.btn_know = ctk.CTkButton(help_win, text=btn_text, state=btn_state, command=help_win.destroy)
-        self.btn_know.pack(pady=20)
+        btn_know = ctk.CTkButton(
+            help_win,
+            text=btn_text,
+            state=btn_state,
+            command=close_help_window,
+        )
+        btn_know.pack(pady=20)
 
         if forced_countdown:
-            self.countdown_val = 10
+            countdown_val = 10
+
             def update_countdown():
-                self.countdown_val -= 1
-                if self.countdown_val > 0:
-                    self.btn_know.configure(text=f"请阅读 ({self.countdown_val}s)")
-                    help_win.after(1000, update_countdown)
-                else:
-                    self.btn_know.configure(text="我知道了", state="normal")
-                    help_win.protocol("WM_DELETE_WINDOW", help_win.destroy)
+                nonlocal countdown_val
+                try:
+                    if not help_win.winfo_exists():
+                        return
+                    countdown_val -= 1
+                    if countdown_val > 0:
+                        btn_know.configure(text=f"请阅读 ({countdown_val}s)")
+                        help_win.after(1000, update_countdown)
+                    else:
+                        btn_know.configure(text="我知道了", state="normal")
+                        help_win.protocol("WM_DELETE_WINDOW", close_help_window)
+                except Exception:
+                    try:
+                        window_alive = bool(help_win.winfo_exists())
+                    except Exception:
+                        window_alive = False
+                    if not window_alive:
+                        clear_help_reference()
+
             help_win.after(1000, update_countdown)
 
     # --- 开机自启逻辑 ---
@@ -475,7 +862,7 @@ class MusicSchedulerApp(DpiStableCTk):
             return f'"{sys.executable}" --silent'
 
         python_exe = sys.executable
-        script_path = os.path.abspath(sys.argv[0])
+        script_path = Path(__file__).resolve()
         return f'"{python_exe}" "{script_path}" --silent'
 
     def check_startup_status(self):
@@ -580,6 +967,9 @@ class MusicSchedulerApp(DpiStableCTk):
         return False
 
     def initiate_add_task_flow(self):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return
         if self.focus_active_task_dialog():
             return
         if not self.music_files:
@@ -705,6 +1095,9 @@ class MusicSchedulerApp(DpiStableCTk):
             )
 
     def finalize_add_task(self, config, f_list, display_name, weekdays_indices):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return
         previous_tasks = copy.deepcopy(self.tasks)
         self.tasks.append({
             "time": config['time'], 
@@ -723,6 +1116,9 @@ class MusicSchedulerApp(DpiStableCTk):
 
     # --- 新的修改任务流程 ---
     def start_modify_task(self, index):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return
         if self.focus_active_task_dialog():
             return
         if not (0 <= index < len(self.tasks)): return
@@ -743,6 +1139,9 @@ class MusicSchedulerApp(DpiStableCTk):
                        initial_data=initial_config)
 
     def finalize_modify(self, edit_task, config, f_list, weekdays_indices, display_name):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return
         if not self.ensure_edit_task_available(edit_task):
             return
 
@@ -764,6 +1163,10 @@ class MusicSchedulerApp(DpiStableCTk):
 
     # --- 任务启用/禁用逻辑 ---
     def toggle_task_enabled(self, index, switch_var):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            self.refresh_task_list()
+            return
         if 0 <= index < len(self.tasks):
             previous_tasks = copy.deepcopy(self.tasks)
             new_state = bool(switch_var.get())
@@ -776,15 +1179,35 @@ class MusicSchedulerApp(DpiStableCTk):
     def refresh_task_list(self):
         for widget in self.schedule_scroll.winfo_children():
             destroy_widget_tree(widget)
-        self.tasks.sort(key=lambda x: x["time"])
+        self.tasks.sort(
+            key=lambda task: task.get("time", "") if isinstance(task, dict) else ""
+        )
         
         week_map = ["一", "二", "三", "四", "五", "六", "日"]
+        controls_state = (
+            "normal"
+            if getattr(self, "_tasks_load_state", "ready") == "ready"
+            else "disabled"
+        )
 
         for idx, task in enumerate(self.tasks):
+            if not isinstance(task, dict):
+                continue
+            time_value = task.get("time")
+            if not MusicSchedulerApp._is_valid_clock(time_value):
+                continue
             f = ctk.CTkFrame(self.schedule_scroll)
             f.pack(fill="x", padx=5, pady=2)
             
-            days_idx = task.get("weekdays", [])
+            raw_days_idx = task.get("weekdays", [])
+            days_idx = []
+            if isinstance(raw_days_idx, list):
+                days_idx = [
+                    day for day in raw_days_idx
+                    if isinstance(day, int)
+                    and not isinstance(day, bool)
+                    and 0 <= day < len(week_map)
+                ]
             if len(days_idx) == 7: days_str = "每天"
             elif len(days_idx) == 0: days_str = "关"
             else:
@@ -793,7 +1216,7 @@ class MusicSchedulerApp(DpiStableCTk):
             
             # 显示时间段 (如果是模式二)
             mode = task.get("mode", "song")
-            time_display = format_clock_for_display(task["time"])
+            time_display = format_clock_for_display(time_value)
             if mode == "duration":
                 next_day_prefix = "次日 " if task.get("end_next_day", False) else ""
                 end_display = format_clock_for_display(task.get("end_time", "?"))
@@ -802,7 +1225,13 @@ class MusicSchedulerApp(DpiStableCTk):
             else:
                 mode_str = "[曲目]"
 
-            info_text = f"{time_display} {mode_str}\n{task['name']} ({len(task.get('files',[]))}首) {days_str}"
+            task_name = task.get("name")
+            if not isinstance(task_name, str) or not task_name.strip():
+                task_name = "未命名任务"
+            task_files = task.get("files", [])
+            if not isinstance(task_files, list):
+                task_files = []
+            info_text = f"{time_display} {mode_str}\n{task_name} ({len(task_files)}首) {days_str}"
             
             # 任务信息
             lbl = ctk.CTkLabel(f, text=info_text, anchor="w", justify="left")
@@ -812,12 +1241,12 @@ class MusicSchedulerApp(DpiStableCTk):
             
             # 1. 删除按钮
             del_btn = ctk.CTkButton(f, text="删除", width=50, fg_color="#CC0000", hover_color="#AA0000", text_color="white",
-                                  command=lambda i=idx: self.delete_task(i))
+                                  command=lambda i=idx: self.delete_task(i), state=controls_state)
             del_btn.pack(side="right", padx=5, pady=5)
             
             # 2. 修改按钮
             edit_btn = ctk.CTkButton(f, text="修改", width=50, fg_color="#1F6AA5", hover_color="#144d7a",
-                                   command=lambda i=idx: self.start_modify_task(i))
+                                   command=lambda i=idx: self.start_modify_task(i), state=controls_state)
             edit_btn.pack(side="right", padx=5, pady=5)
 
             # 3. 启用/禁用开关
@@ -827,12 +1256,15 @@ class MusicSchedulerApp(DpiStableCTk):
             cmd_toggle = lambda i=idx, v=switch_var: self.toggle_task_enabled(i, v)
             
             enable_switch = ctk.CTkSwitch(f, text="开启", variable=switch_var, command=cmd_toggle, 
-                                          width=60, onvalue=1, offvalue=0)
+                                          width=60, onvalue=1, offvalue=0, state=controls_state)
             enable_switch.pack(side="right", padx=(5, 10), pady=5)
         
         self.update_top_status()
 
     def delete_task(self, index):
+        if not self._tasks_are_writable():
+            self._warn_tasks_read_only()
+            return
         if 0 <= index < len(self.tasks):
             previous_tasks = copy.deepcopy(self.tasks)
             deleted_task = self.tasks.pop(index)
@@ -1000,28 +1432,54 @@ class MusicSchedulerApp(DpiStableCTk):
         try:
             now = datetime.now()
             current_time_str = now.strftime("%H:%M:%S")
-            current_weekday = now.weekday()
-
-            if self.last_trigger_date != now.date():
-                self.last_trigger_date = now.date()
-                self.triggered_tasks.clear()
-
             self.time_label.configure(text=current_time_str)
 
             # 1. 检查是否有任务需要开始
-            for task in list(self.tasks):
-                if not task.get("enabled", True):
-                    continue
+            previous_tick = self.last_tick_dt
+            if previous_tick is not None and now < previous_tick:
+                # 系统时钟回拨时不补播，避免旧任务重复触发。
+                self.last_tick_dt = now
+            else:
+                if previous_tick is None:
+                    interval_start = now.replace(microsecond=0) - timedelta(microseconds=1)
+                else:
+                    interval_start = previous_tick
+                grace_start = now - timedelta(seconds=SCHEDULE_GRACE_SECONDS)
+                scan_start = max(interval_start, grace_start)
 
-                trigger_key = (id(task), task.get("time"))
-                should_start = (
-                    task.get("time") == current_time_str
-                    and current_weekday in task.get("weekdays", [])
-                    and trigger_key not in self.triggered_tasks
-                )
-                if should_start:
-                    self.triggered_tasks.add(trigger_key)
-                    self.start_playlist(task)
+                due_candidates = []
+                candidate_date = scan_start.date()
+                while candidate_date <= now.date():
+                    for task_index, task in enumerate(list(self.tasks)):
+                        if not isinstance(task, dict) or not task.get("enabled", True):
+                            continue
+                        time_value = task.get("time")
+                        if not MusicSchedulerApp._is_valid_clock(time_value):
+                            continue
+                        weekdays = task.get("weekdays", [])
+                        if (
+                            not isinstance(weekdays, list)
+                            or candidate_date.weekday() not in weekdays
+                        ):
+                            continue
+
+                        task_time = datetime.strptime(time_value, "%H:%M:%S").time()
+                        candidate = datetime.combine(candidate_date, task_time)
+                        if (
+                            interval_start < candidate <= now
+                            and candidate >= grace_start
+                        ):
+                            due_candidates.append((candidate, task_index, task))
+                    candidate_date += timedelta(days=1)
+
+                # 先推进基线，即使播放启动失败也不在后续 tick 中反复尝试。
+                self.last_tick_dt = now
+                if due_candidates:
+                    _, _, task_to_start = max(
+                        due_candidates,
+                        key=lambda item: (item[0], item[1]),
+                    )
+                    self.start_playlist(task_to_start)
 
             # 2. 检查当前播放是否需要处理
             if self.is_playlist_active:
