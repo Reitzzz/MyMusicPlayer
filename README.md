@@ -1,191 +1,85 @@
-# 音乐定时播放系统 Pro
+# 定时播放器
 
-一个面向 Windows 的本地定时音乐播放器。它可以按照指定时间和星期自动播放歌单，支持固定曲目、固定时长循环（含跨午夜）、系统托盘和开机自启动。
+一个面向 Windows 的本地定时音乐播放器。程序使用固定 1000×750 逻辑像素的无边框深色网页界面，音频和任务数据全部留在本地，不依赖 CDN 或在线服务。
 
-## 主要功能
+## 运行环境
 
-- 按星期和精确时间创建播放任务。
-- 固定曲目模式：按顺序播放选中的歌曲，播放完毕后停止。
-- 固定时长模式：循环播放歌单，到达结束时间后自动停止，并可设置次日结束。
-- 支持创建、修改、删除、启用和禁用任务。
-- 自动扫描程序目录下的 `mp3/` 和 `changyong/` 文件夹。
-- 支持 MP3、FLAC、WAV、OGG、M4A、WMA 和 AAC 文件。
-- 关闭主窗口后继续在系统托盘运行。
-- 支持 Windows 当前用户开机自启动和静默启动。
-- 使用 Windows Mutex 防止同一用户会话中重复运行。
-- 任务使用相对音乐路径，移动整个程序目录后仍可继续使用。
+- Windows 10/11
+- Python 3.11+（本仓库约定解释器为 `D:\Python\python.exe`）
+- Microsoft Edge WebView2 Runtime
+- pygame、pystray、Pillow、pywebview 6.x
 
-## 下载和使用 EXE
-
-1. 从 GitHub Releases 下载 ZIP 压缩包。
-2. 将 ZIP 完整解压到一个可写目录，不要直接在压缩包中运行。
-3. 运行 `music.exe`。
-4. 把音乐文件放入与 `music.exe` 同级的 `mp3/` 或 `changyong/` 文件夹。
-5. 返回程序并点击“刷新音乐列表”。
-6. 在“任务列表”中点击“+ 创建新任务”，按向导完成设置。
-
-程序会在同级目录保存：
-
-- `tasks.json`：定时任务和歌单配置。
-- `config.json`：首次运行等程序设置。
-
-请不要只移动 `music.exe`。建议始终整体移动包含 EXE、配置和音乐目录的文件夹。
-
-## 创建任务与时间输入
-
-创建或修改任务时，先在“设置播放时间”窗口完成以下设置，再依次选择歌曲、播放星期和任务名称：
-
-1. 设置开始时间。
-2. 选择播放行为：固定曲目，或固定时长循环。
-3. 固定时长模式下，设置结束时间；若结束时间在次日，勾选“次日结束”。
-
-时间输入使用独立的小时和分钟栏位。可直接输入数字，也可使用上下方向键、鼠标滚轮或右侧按钮调整；粘贴 `13:00`、`1300` 等常见时间格式也会自动识别。输入有效的时间后，“下一步”按钮才会启用。
-
-## 任务模式
-
-### 固定曲目
-
-按照用户设置的歌曲顺序播放一次，全部播放完成后停止。
-
-### 固定时长
-
-在开始时间到结束时间之间循环播放歌单，到达结束时间后停止。默认情况下，结束时间必须晚于开始时间；若要跨午夜播放（例如周一 23:30 至次日 00:30），请勾选“次日结束”。任务会在所选星期的开始时间触发，并在次日的结束时间停止。
-
-如果任务中的歌曲全部不存在或无法播放，程序会停止该任务并显示错误，不会无限重试。
-
-## 定时补触发与任务冲突
-
-界面刷新、文件扫描或系统短暂卡顿跨过计划秒时，程序会补播最近 90 秒内错过的任务。程序刚启动时不会追溯启动前的历史任务；系统休眠或停顿超过 90 秒后，过期任务也不会突然播放。
-
-如果同一次检查发现多个待补播任务，只播放计划时间最接近当前时间的任务；若多个任务的计划时间相同，则播放任务列表中排在最后的任务。
-
-## 任务文件保护与恢复
-
-程序兼容带 UTF-8 BOM 的 `tasks.json`。如果文件无法解析或结构错误，程序会把原文件复制为 `tasks.corrupt-日期时间.json`，并在本次运行中禁止新增、修改、删除或启停任务，避免空任务列表覆盖原数据。请检查或恢复 `tasks.json`，然后重启程序。
-
-如果文件中只有部分任务或字段非法，程序会先备份原文件，再加载仍然有效的任务，并在界面中提示跳过和修正数量。原始内容始终可以从对应的 `.corrupt` 文件中恢复。
-
-无损归一化不会触发备份或告警：旧版本保存的音频绝对路径会被自动转换为相对程序目录的便携路径，缺失的字段（例如 `enabled`）会补上默认值。只有丢弃任务、丢弃列表元素，或把显式存在的非法值替换为默认值时，才视为有损修正并备份原文件。
-
-## 系统要求
-
-运行打包后的 EXE：
-
-- Windows 10 或 Windows 11
-- 可用的音频输出设备
-- 无需另外安装 Python
-
-从源码运行或打包：
-
-- Python 3.12
-- CustomTkinter
-- pygame
-- pystray
-- Pillow
-- PyInstaller（仅打包需要）
-
-## 从源码运行
-
-本仓库维护环境固定使用 `D:\Python\python.exe`：
+安装依赖：
 
 ```powershell
-D:\Python\python.exe -m pip install customtkinter pygame pystray Pillow pyinstaller
+D:\Python\python.exe -m pip install "pywebview>=6.2,<7" pygame pystray Pillow pyinstaller
+```
+
+如果 WebView2 Runtime 或 pywebview 缺失，程序不会回退到旧的 Tk 界面，而是显示可理解的 Windows 原生错误提示。
+
+## 启动与打包
+
+源码启动：
+
+```powershell
 D:\Python\python.exe music.py
 ```
 
-代码语法检查：
+静默启动（用于开机自启，窗口保留在系统托盘）：
 
 ```powershell
-D:\Python\python.exe -m py_compile music.py windowing.py song_widgets.py task_dialogs.py
+D:\Python\python.exe music.py --silent
 ```
 
-运行标准库回归测试：
-
-```powershell
-D:\Python\python.exe -m unittest discover -s tests -v
-```
-
-## 打包 Windows EXE
-
-仓库中的 `music.spec` 是正式 PyInstaller 配置。请在项目根目录执行：
+打包：
 
 ```powershell
 D:\Python\python.exe -m PyInstaller music.spec
 ```
 
-打包完成后：
+`music.spec` 生成独立的单文件可执行程序 `dist/music.exe`。静态界面资源（`ui/`）已内置打包，运行时自动解包加载；用户配置与音乐目录（`tasks.json`、`config.json`、`mp3/`、`changyong/`）仍保存在 `music.exe` 所在同级目录下。
 
-- 最终程序位于 `dist/music.exe`。
-- `build/` 是临时构建缓存，可以删除。
-- `dist/` 中的 EXE 是发布产物，不要在发布前删除。
+## 使用说明
 
-建议发布 ZIP 结构：
+1. 将 `.mp3`、`.flac`、`.wav`、`.ogg`、`.m4a`、`.wma` 或 `.aac` 文件放入程序目录下的 `mp3/` 或 `changyong/`，点击“刷新音乐列表”。
+2. 在“播放任务”中创建任务，按四步向导设置开始时间与模式、歌曲及顺序、星期、名称。
+3. “固定曲目”按顺序播放一次；“固定时长”循环歌单，达到结束时间停止，可选“次日结束”。
+4. 关闭窗口会隐藏到托盘；托盘菜单可重新显示窗口或退出程序。托盘不可用时关闭窗口会直接退出。
+
+任务删除是立即删除并通过 Toast 提示，不提供撤销或确认弹层。所有写操作都由后台桥接层验证，并返回保存后的权威状态。
+
+## 数据与路径
+
+- `tasks.json`：任务列表，保持原有字段结构（`time`、`mode`、`end_time`、`end_next_day`、`files`、`name`、`weekdays`、`enabled`）。音频路径优先保存为相对于程序目录的便携路径。
+- `config.json`：首次运行标记等配置。
+- `mp3/`、`changyong/`：用户音频目录，程序不会删除、移动或重编码其中内容。
+
+读取 `tasks.json` 时，如果发现 JSON 损坏或显式字段无效，程序会先生成唯一的 `tasks.corrupt-*.json` 备份，再加载可用任务；备份失败时进入只读保护。正常保存使用临时文件、刷新和原子替换，避免半写入文件。
+
+程序目录以 `music.py` 所在目录（打包后为 EXE 所在目录）为资源根，不依赖调用程序时的当前工作目录。单实例由 Windows Mutex 保护，重复启动会唤醒已有窗口。
+
+## 代码结构
 
 ```text
-MusicScheduler-Pro/
-├── music.exe
-├── mp3/
-└── changyong/
+music.py          路径、Mutex 与启动装配入口
+player_core.py    TaskStore、PlaybackEngine、SchedulerService、控制器
+web_app.py        pywebview 桥接、窗口、托盘、串行事件队列
+ui/index.html     离线 HTML 与 SVG 图标
+ui/app.css        方案 B（夜航播放）视觉令牌与布局
+ui/app.js         状态渲染、交互和四步任务向导
+music.spec        PyInstaller 配置
+tests/            不依赖 GUI 的回归测试
 ```
 
-`config.json` 和 `tasks.json` 可以不放进首次发布包，程序会按需创建；如果希望提供空白文件，可分别使用 `{"first_run": false}` 和 `[]`。
+调度器每 500ms 检查一次，支持最多 90 秒的延迟补触发；已触发时间点不会重复执行，系统时钟回拨会重置基线而不补播。播放失败时会跳过坏曲目，固定时长结束后停止，所有操作都经过可重复的退出清理。
 
-## 项目结构
+## 验证
 
-```text
-MusicPlayer/
-├── music.py          # 程序入口、主界面、任务协调、调度与播放逻辑
-├── windowing.py      # DPI 控制、窗口基类和父子窗口状态同步
-├── song_widgets.py   # 轻量歌曲行、文字省略与悬停跑马灯
-├── task_dialogs.py   # 时间、歌曲、星期和命名任务向导
-├── tests/            # 任务存储、调度、帮助窗、自启和托盘回归测试
-├── music.spec        # PyInstaller 打包配置
-├── config.json       # 本地程序配置
-├── tasks.json        # 本地任务数据
-├── mp3/              # 普通音乐目录
-├── changyong/        # 常用音乐目录
-├── AGENTS.md         # 自动化代理协作约定
-└── README.md
+```powershell
+D:\Python\python.exe -c "import sys; print(sys.executable)"
+D:\Python\python.exe -m py_compile music.py player_core.py web_app.py
+D:\Python\python.exe -m unittest discover -s tests -v
+D:\Python\python.exe -m PyInstaller music.spec
 ```
 
-### 当前代码拆分原则
-
-当前拆分属于不改变程序行为的第一阶段整理：
-
-- `music.py` 仍是唯一启动入口，`music.spec` 不需要改用其他入口。
-- `windowing.py` 不依赖主程序，只提供可复用的 DPI 和窗口能力。
-- `song_widgets.py` 只负责歌曲行绘制和交互，不读取任务或配置。
-- `task_dialogs.py` 通过父窗口与回调连接主程序，不反向导入 `music.py`。
-- `music.py` 继续重导出拆出的窗口和控件类，兼容已有的 `import music` 调试代码。
-
-依赖方向保持为：`song_widgets.py` 和 `windowing.py` → `task_dialogs.py` → `music.py`。禁止基础模块反向导入 `music.py`，避免循环导入。
-
-### 什么时候进入第二阶段拆分
-
-目前不应仅因为文件行数继续拆分。出现以下任一情况时，再考虑提取独立的任务存储、音频播放和调度服务：
-
-- 任务 JSON 开始需要版本迁移、字段校验、自动备份、恢复或被多个模块同时读写。
-- 音频功能加入暂停、音量、淡入淡出、输出设备切换、播放失败恢复，导致播放状态继续散落在主界面中。
-- 调度需要支持系统休眠后补触发、时区、冲突任务或无需 GUI 的后台运行。
-- 连续的功能修改必须同时改动主界面、播放状态和调度循环，已经难以单独验证其中一项。
-- `MusicSchedulerApp` 的共享状态使后台线程直接依赖控件，或问题只能通过启动完整 GUI 才能复现。
-
-进入第二阶段前，应先为以下纯逻辑补充自动化测试：
-
-- 任务数据的读取、保存、默认值和旧数据兼容。
-- 音频队列的下一首、循环、失败跳过和停止状态转换。
-- 下次运行时间、星期匹配、跨日期边界和重复触发保护。
-- 音频路径的相对化、程序目录迁移和文件缺失处理。
-
-测试稳定后，再依次提取 `TaskStore`、`PlaybackEngine` 和 `SchedulerService`。这些服务应通过普通参数、返回值、回调或线程安全队列与 UI 通信，Tk 控件仍只允许在主线程更新。
-
-## 使用注意事项
-
-- 定时播放期间请关闭 Windows 自动睡眠；程序只补播最近 90 秒内错过的任务，长时间休眠后的过期任务不会补播。
-- 首次启用开机自启动后，如果移动了程序目录，请在新位置重新勾选“开机自启”。程序会识别并提示失效的旧启动路径。
-- 删除或重命名任务中的音乐文件后，请刷新音乐列表并修改对应任务。
-- 托盘正常时，主窗口右上角的关闭按钮只会隐藏窗口；需要彻底退出时，请使用托盘菜单中的“退出程序”。托盘不可用时，程序会显示主窗口和警告，关闭窗口将直接退出。
-
-## 数据与隐私
-
-程序在本地运行，不会上传音乐、任务或配置。任务数据和设置保存在程序目录中，请在升级或迁移前备份 `tasks.json`。
+浏览器交互/视觉检查可使用 `ui/index.html?mock=1`。mock 仅在显式查询参数存在时启用，生产页默认只等待真实的 pywebview bridge。

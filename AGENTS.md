@@ -7,14 +7,14 @@
 - 本仓库所有 Python 相关命令都固定使用 `D:\Python\python.exe`。执行 Python 代码、脚本、模块、测试、构建或依赖操作时，命令必须显式写出该完整解释器路径。
 - 安装、查询或升级依赖时统一使用 `D:\Python\python.exe -m pip ...`；运行模块、测试和构建时使用 `D:\Python\python.exe -m ...`。
 - 执行任何 Python 操作前，使用 `D:\Python\python.exe -c "import sys; print(sys.executable)"` 验证 `sys.executable` 位于 `D:\Python`。验证结果不符合时立即停止并报告，不改用其他解释器。
-- 运行 PyInstaller 时统一使用 `D:\Python\python.exe -m PyInstaller music.spec`。
+- 运行 PyInstaller 时统一使用 `D:\Python\python.exe -m PyInstaller music.spec`。除非明确要求，否则使用单文件打包，产物为独立的 `dist/music.exe`。
 
 ## 项目说明
 
 - 这是一个面向 Windows 的本地定时音乐播放器，`music.py` 是程序入口，但不是唯一的源码文件。
-- `windowing.py` 提供窗口、DPI 和窗口树相关支持；`song_widgets.py` 提供歌曲列表控件；`task_dialogs.py` 提供任务及歌曲选择对话框。修改功能时按依赖关系阅读所有受影响模块。
-- GUI 使用 CustomTkinter；音频播放使用 pygame；系统托盘使用 pystray/Pillow；程序还依赖 Windows 注册表和 Mutex 等平台能力。
-- `music.spec` 是 PyInstaller 打包配置。
+- `player_core.py` 提供任务持久化（`TaskStore`）、音频播放（`PlaybackEngine`）、定时调度（`SchedulerService`）与业务控制器（`MusicPlayerController`）；`web_app.py` 提供原生窗口外壳、事件队列与托盘；`ui/` 提供前端页面、样式与交互向导。修改功能时按依赖关系阅读所有受影响模块。
+- GUI 使用 `pywebview`（EdgeChromium / WebView2）加载本地 `ui/` 资源；音频播放使用 `pygame`；系统托盘使用 `pystray`/`Pillow`；程序还依赖 Windows 注册表和 Mutex 等平台能力。
+- `music.spec` 是 PyInstaller 打包配置，默认内嵌 `ui/` 并单文件打包。
 
 ## 路径与用户状态
 
@@ -33,7 +33,7 @@
 ## 代码约定
 
 - 优先做小而清晰的改动，沿用现有结构和命名风格；除非任务需要，不进行大规模重构。
-- Tk 控件只能由 Tk 主线程更新。后台线程（包括托盘线程）通过线程安全队列传递事件，由 Tk 主线程使用 `after()` 取出并处理；共享的播放状态、任务状态和文件数据需要采用合适的线程安全方案。
+- 前端页面呈现与原生后台完全解耦：前端通过 `window.pywebview.api` 调用 `WebBridge`，后端通过带锁的 `MusicPlayerController` 修改状态并返回权威状态；后台与托盘线程通过线程安全队列调度原生行为，严禁跨线程直接操纵前端或窗口对象。
 - 所有文件、音频设备、托盘对象和后台线程都应有明确的异常处理与清理逻辑。修改初始化、运行或退出生命周期时，必须同步补充失败回滚、资源释放、线程停止和窗口销毁等退出清理路径，并保证清理可安全重复执行。
 - 面向用户的错误应给出可理解的提示；诊断信息保留足够上下文，但不得泄露敏感数据。
 - 优先复用现有第三方依赖和 Python 标准库。确需新增依赖时先说明理由，并同步更新 `README.md` 中的安装说明。
@@ -45,6 +45,6 @@
 1. 读取相关代码、配置和数据边界，确认受影响的模块、路径和用户状态。完成条件：已明确需要修改的文件以及必须保持不变的数据。
 2. 修改所有必要文件并检查改动范围。完成条件：需求已实现，没有无关文件改动，且用户已有改动得到保留。
 3. 对所有受影响的 Python 模块执行语法检查，使用固定解释器 `D:\Python\python.exe -m py_compile <受影响模块...>`。完成条件：每个受影响模块检查通过；若固定解释器不可用，报告阻塞原因。
-4. 仓库中有测试时，使用 `D:\Python\python.exe -m pytest` 运行相关测试；若未安装 pytest，报告缺失依赖，不切换解释器。完成条件：测试结果和未运行项目被明确记录。
+4. 运行相关自动化测试，使用固定解释器 `D:\Python\python.exe -m unittest discover -s tests -v`。完成条件：所有用例执行完毕且全部通过（OK）。
 5. 涉及 GUI、系统托盘、开机启动、音频播放或打包时，分别记录已完成的自动验证和仍需在 Windows 桌面环境中人工验证的范围。涉及打包时使用 `D:\Python\python.exe -m PyInstaller music.spec`，并检查生成程序的启动、资源加载和退出行为。完成条件：自动验证与人工验证边界清楚，未把未执行的检查描述为已通过。
 6. 最后报告修改内容、执行过的验证、测试结果和未验证风险。完成条件：报告完整、可复核，并准确区分通过、未执行和受环境限制的项目。

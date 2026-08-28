@@ -1,16 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+"""PyInstaller configuration for the pywebview music player."""
 
-datas = []
+from pathlib import Path
+
+# PyInstaller executes a spec file as a namespace without ``__file__``.
+# The build command is run from the repository root, so resolve data from the
+# current build root rather than relying on the packaged app's runtime CWD.
+SPEC_ROOT = Path.cwd().resolve()
+
+datas = [
+    (str(SPEC_ROOT / "ui" / "index.html"), "ui"),
+    (str(SPEC_ROOT / "ui" / "app.css"), "ui"),
+    (str(SPEC_ROOT / "ui" / "app.js"), "ui"),
+]
 binaries = []
-hiddenimports = []
-tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = [
+    "webview.platforms.edgechromium",
+    "webview.platforms.winforms",
+]
 
 
 a = Analysis(
-    ['music.py'],
-    pathex=[],
+    ["music.py"],
+    pathex=[str(SPEC_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -29,7 +41,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='music',
+    name="music",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>定时播放器</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></symbol>
+    <symbol id="i-radio" viewBox="0 0 24 24"><path d="M4 7h16v13H4zM8 3l8 4M8 12h.01M12 12h.01M16 12h.01M8 16h8"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18M12 13v4M12 13l3 2"/></symbol>
+    <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 5h3v14H4zM10 3h3v16h-3zM16 5h3v14h-3zM3 21h18"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.7-3L3 11M4 5v6h6M4 13a8 8 0 0 0 14.7 3L21 13m0 6v-6h-6"/></symbol>
+    <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.8 1.7c-1 .7-1.6 1.2-1.6 2.8M12 17h.01"/></symbol>
+    <symbol id="i-square" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 5h5v5M19 5l-8 8M5 7v12h12M8 4H5a1 1 0 0 0-1 1v3"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9M6.6 5.6a8 8 0 1 0 10.8 0"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="m4 16 0-4L15 3l4 4L8 18H4zM13 5l4 4M4 21h16"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="m14 5-7 7 7 7M7 12h13"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="m10 5 7 7-7 7M4 12h13"/></symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="m12 19V5m-6 6 6-6 6 6"/></symbol>
+    <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v14m6-6-6 6-6-6"/></symbol>
+    <symbol id="i-grip" viewBox="0 0 24 24"><circle cx="8" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="16" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="8" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="16" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="8" cy="18" r="1" fill="currentColor" stroke="none"/><circle cx="16" cy="18" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-minus-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M5 10v4h3l4 4V6L8 10zM16 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 3 20h18zM12 9v5M12 17h.01"/></symbol>
+  </svg>
+
+  <div class="app-window" id="app" data-view="tasks">
+    <header class="titlebar">
+      <div class="title-drag-area pywebview-drag-region"><div class="title-id"><span class="app-mark"><svg class="icon"><use href="#i-music"></use></svg></span><span>夜航播放</span></div></div>
+      <div class="window-actions">
+        <button class="window-button" type="button" data-action="tray-menu" aria-label="打开托盘菜单" aria-expanded="false"><svg class="icon"><use href="#i-more"></use></svg></button>
+        <button class="window-button" type="button" data-action="minimize" aria-label="最小化"><svg class="icon"><use href="#i-minus"></use></svg></button>
+        <button class="window-button close-window" type="button" data-action="close" aria-label="关闭窗口"><svg class="icon"><use href="#i-x"></use></svg></button>
+      </div>
+    </header>
+
+    <div class="tray-menu is-hidden" id="tray-menu" role="menu" aria-label="系统托盘菜单">
+      <button type="button" role="menuitem" data-action="show-window"><svg class="icon"><use href="#i-open"></use></svg>显示窗口</button>
+      <button type="button" role="menuitem" class="tray-exit" data-action="exit"><svg class="icon"><use href="#i-power"></use></svg>退出程序</button>
+    </div>
+
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand" aria-label="定时播放器">
+        <span class="app-mark"><svg class="icon"><use href="#i-radio"></use></svg></span>
+        <div class="brand-copy"><div class="brand-name">定时播放器</div><div class="brand-caption">PRO · 本地运行</div></div>
+      </div>
+      <nav class="nav-list" aria-label="页面">
+        <button type="button" class="nav-button" data-view-button="tasks" aria-current="page" aria-label="任务列表"><svg class="icon"><use href="#i-calendar"></use></svg><span>任务列表</span></button>
+        <button type="button" class="nav-button" data-view-button="library" aria-label="音乐库"><svg class="icon"><use href="#i-library"></use></svg><span>音乐库</span></button>
+      </nav>
+      <div class="side-section-label">工具</div>
+      <button type="button" class="side-action" data-action="refresh" aria-label="刷新音乐列表"><svg class="icon"><use href="#i-refresh"></use></svg><span>刷新音乐列表</span></button>
+      <button type="button" class="side-action" data-action="help" aria-label="使用说明"><svg class="icon"><use href="#i-help"></use></svg><span>使用说明</span></button>
+      <div class="switch-row"><span class="switch-copy">开机自启</span><label class="switch"><span class="sr-only">开机自启</span><input id="startup-switch" type="checkbox"></label></div>
+      <div class="side-spacer"></div>
+      <button type="button" class="side-action stop-action" data-action="stop" aria-label="停止播放"><svg class="icon"><use href="#i-square"></use></svg><span>停止播放</span></button>
+    </aside>
+
+    <main class="main-area" id="main-content" tabindex="-1">
+      <section class="now-panel" aria-label="当前播放状态">
+        <div><div class="clock-label">当前时间</div><div class="live-clock" id="live-clock">00:00:00</div></div>
+        <div class="now-copy"><div class="eyebrow" id="now-eyebrow">下一次播放</div><div class="next-title" id="now-title">暂无任务</div><div class="next-detail" id="now-detail">添加任务后将在这里显示播放计划</div><div class="waveform" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
+      </section>
+
+      <section id="tasks-view" aria-labelledby="tasks-heading">
+        <div class="content-header"><div><h1 class="content-title" id="tasks-heading">播放任务</h1><div class="content-caption">按时间自动保存与执行</div></div><button type="button" class="primary-button" data-action="create"><svg class="icon"><use href="#i-plus"></use></svg>创建新任务</button></div>
+        <div class="task-list" id="task-list"></div>
+      </section>
+
+      <section id="library-view" class="is-hidden" aria-labelledby="library-heading">
+        <div class="content-header"><div><h1 class="content-title" id="library-heading">音乐库</h1><div class="content-caption" id="library-count">暂无音频文件</div></div><button type="button" class="secondary-button" data-action="refresh"><svg class="icon"><use href="#i-refresh"></use></svg>刷新</button></div>
+        <div class="library-list" id="library-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer"><span class="status-message" id="status-message" role="status" aria-live="polite"><svg class="icon"><use href="#i-check-circle"></use></svg><span>就绪</span></span><span>v2.0 · 本地运行</span></footer>
+
+    <div class="dialog-backdrop is-hidden" id="dialog-backdrop" role="presentation"><section class="dialog" id="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"></section></div>
+    <div class="toast is-hidden" id="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
