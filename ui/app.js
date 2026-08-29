@@ -182,7 +182,7 @@
     title.textContent = next.name || "未命名任务";
     const mode = next.mode === "duration" ? "固定时长" : "固定曲目";
     const count = `${next.files_count || 0} 首`;
-    detail.textContent = `${mode} · ${count} · ${next.weekdays_label || "未设置日期"}`;
+    detail.textContent = `${mode} · ${count} · ${formatWeekdays(next.weekdays)}`;
   }
 
   function renderTasks() {
@@ -433,7 +433,7 @@
         { path: "mp3/午后爵士.wav", name: "午后爵士.wav", folder: "mp3" },
         { path: "changyong/雨夜白噪音.ogg", name: "雨夜白噪音.ogg", folder: "changyong" },
       ],
-      next_run: { date_label: "今天", time: "09:00", name: "晨间钢琴", mode: "song", files_count: 4, weekdays_label: "周一、二、三、四、五", index: 0 },
+      next_run: { date_label: "今天", time: "09:00", name: "晨间钢琴", mode: "song", files_count: 4, weekdays: [0, 1, 2, 3, 4] },
       status: { message: "就绪 · 任务已自动保存", tone: "success" },
     };
     function reply() { return { ok: true, state: JSON.parse(JSON.stringify(mockState)) }; }

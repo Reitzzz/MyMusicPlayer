@@ -34,6 +34,8 @@ except Exception:  # pragma: no cover
 from player_core import MusicPlayerController
 
 
+# Must stay equal to music.WINDOW_TITLE: the single-instance guard locates a
+# running window by this exact caption via FindWindowW.
 WINDOW_TITLE = "定时播放器"
 WINDOW_WIDTH = 1000
 WINDOW_HEIGHT = 750

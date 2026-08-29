@@ -10,19 +10,8 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
-
-from player_core import (
-    CONFIG_FILE,
-    MUSIC_DIRECTORIES,
-    SCHEDULE_GRACE_SECONDS,
-    TASKS_FILE,
-    calculate_task_end_at as _calculate_task_end_at,
-    make_portable_music_path as _make_portable_music_path,
-    resolve_music_path as _resolve_music_path,
-)
+from typing import Any
 
 
 def _application_directory() -> Path:
@@ -32,28 +21,12 @@ def _application_directory() -> Path:
 
 
 APPLICATION_DIR = _application_directory()
-TASKS_PATH = APPLICATION_DIR / TASKS_FILE
-CONFIG_PATH = APPLICATION_DIR / CONFIG_FILE
-
-
-def resolve_music_path(path_value: str | os.PathLike[str]) -> str:
-    """Resolve a task path relative to the executable/resource directory."""
-
-    return _resolve_music_path(path_value, APPLICATION_DIR)
-
-
-def make_portable_music_path(path_value: str | os.PathLike[str]) -> str:
-    """Convert a task path to the portable ``tasks.json`` representation."""
-
-    return _make_portable_music_path(path_value, APPLICATION_DIR)
-
-
-def calculate_task_end_at(task: Mapping[str, Any], started_at: datetime) -> datetime | None:
-    return _calculate_task_end_at(task, started_at)
-
 
 MUTEX_NAME = "Global_MusicScheduler_Instance_Lock"
 ERROR_ALREADY_EXISTS = 183
+# Must stay equal to web_app.WINDOW_TITLE: wake_existing_window() finds the
+# running instance by this exact caption. Changing one side alone silently
+# breaks single-instance wake-up.
 WINDOW_TITLE = "定时播放器"
 
 
@@ -114,23 +87,6 @@ def main(argv: list[str] | None = None) -> int:
         return run_web_app(APPLICATION_DIR, silent="--silent" in args)
     finally:
         release_single_instance(mutex)
-
-
-__all__ = [
-    "APPLICATION_DIR",
-    "CONFIG_PATH",
-    "MUSIC_DIRECTORIES",
-    "SCHEDULE_GRACE_SECONDS",
-    "TASKS_PATH",
-    "WINDOW_TITLE",
-    "acquire_single_instance",
-    "calculate_task_end_at",
-    "main",
-    "make_portable_music_path",
-    "release_single_instance",
-    "resolve_music_path",
-    "wake_existing_window",
-]
 
 
 if __name__ == "__main__":

@@ -244,6 +244,28 @@ class ControllerRegressionTests(unittest.TestCase):
             self.assertTrue(tasks[0]["end_next_day"])
             controller.shutdown()
 
+    def test_next_run_sends_raw_weekdays_for_the_page_to_format(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            controller = MusicPlayerController(root, initialize_audio=False)
+            self.assertTrue(
+                controller.save_task(
+                    {
+                        "time": "09:30",
+                        "mode": "song",
+                        "files": ["mp3/ok.mp3"],
+                        "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                        "name": "daily",
+                    }
+                )["ok"]
+            )
+            next_run = controller.get_state()["next_run"]
+            self.assertEqual([0, 1, 2, 3, 4, 5, 6], next_run["weekdays"])
+            # Weekday wording lives only in ui/app.js's formatWeekdays.
+            self.assertNotIn("weekdays_label", next_run)
+            controller.shutdown()
+
 
 class _FakeEvent:
     def __init__(self):

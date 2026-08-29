@@ -1025,29 +1025,17 @@ class MusicPlayerController:
             self._set_status(f"已{'启用' if enabled else '暂停'}任务：{name}", "success", toast=True)
             return {"ok": True, "state": self.get_state()}
 
-    @staticmethod
-    def _display_weekdays(days: Any) -> str:
-        if not isinstance(days, list):
-            return "未设置日期"
-        valid = [day for day in days if isinstance(day, int) and 0 <= day <= 6]
-        names = ["一", "二", "三", "四", "五", "六", "日"]
-        if len(valid) == 7:
-            return "每天"
-        if not valid:
-            return "未设置日期"
-        return "周" + "、".join(names[day] for day in valid)
-
     def _get_next_run_info(self, now: datetime) -> dict[str, Any] | None:
-        candidates: list[tuple[datetime, Mapping[str, Any], int]] = []
-        for index, task in enumerate(self.tasks):
+        candidates: list[tuple[datetime, Mapping[str, Any]]] = []
+        for task in self.tasks:
             if not task.get("enabled", True):
                 continue
             next_run = self.get_next_run(task, now)
             if next_run is not None:
-                candidates.append((next_run, task, index))
+                candidates.append((next_run, task))
         if not candidates:
             return None
-        next_run, task, index = min(candidates, key=lambda item: item[0])
+        next_run, task = min(candidates, key=lambda item: item[0])
         day_offset = (next_run.date() - now.date()).days
         if day_offset == 0:
             day_text = "今天"
@@ -1056,14 +1044,14 @@ class MusicPlayerController:
         else:
             day_text = f"周{['一', '二', '三', '四', '五', '六', '日'][next_run.weekday()]}"
         return {
-            "datetime": next_run.isoformat(),
             "date_label": day_text,
             "time": next_run.strftime("%H:%M"),
             "name": str(task.get("name", "未命名任务")),
             "mode": task.get("mode", "song"),
             "files_count": len(task.get("files", [])) if isinstance(task.get("files"), list) else 0,
-            "weekdays_label": self._display_weekdays(task.get("weekdays", [])),
-            "index": index,
+            # The page formats weekday labels itself; sending the raw list keeps
+            # that wording in one place.
+            "weekdays": list(task.get("weekdays", [])) if isinstance(task.get("weekdays"), list) else [],
         }
 
     @staticmethod
