@@ -86,11 +86,11 @@ class WebBridge:
     def save_task(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return self._app.controller.save_task(payload or {})
 
-    def delete_task(self, index: Any) -> dict[str, Any]:
-        return self._app.controller.delete_task(index)
+    def delete_task(self, index: Any, expected_revision: Any = None) -> dict[str, Any]:
+        return self._app.controller.delete_task(index, expected_revision)
 
-    def set_task_enabled(self, index: Any, enabled: Any) -> dict[str, Any]:
-        return self._app.controller.set_task_enabled(index, enabled)
+    def set_task_enabled(self, index: Any, enabled: Any, expected_revision: Any = None) -> dict[str, Any]:
+        return self._app.controller.set_task_enabled(index, enabled, expected_revision)
 
     def play_track(self, path: Any) -> dict[str, Any]:
         return self._app.controller.play_track(path)
@@ -112,6 +112,9 @@ class WebBridge:
 
     def show(self) -> dict[str, Any]:
         return self._app.controller.window_command("show")
+
+    def close(self) -> dict[str, Any]:
+        return self._app.request_close()
 
     def exit(self) -> dict[str, Any]:
         return self._app.controller.window_command("exit")
@@ -165,10 +168,18 @@ class WebApp:
                 break
         return events
 
+    def request_close(self) -> dict[str, Any]:
+        if self._closing:
+            return {"ok": True, "state": self.controller.get_state()}
+        self.enqueue_native_action("close")
+        return {"ok": True, "state": self.controller.get_state()}
+
     def enqueue_native_action(self, action: str) -> None:
         """Queue a window action without touching webview from worker threads."""
 
-        if action in {"minimize", "hide", "show", "exit"}:
+        if self._closing:
+            return
+        if action in {"minimize", "hide", "show", "exit", "close"}:
             self._native_action_queue.put(action)
 
     def _dispatch_native_actions(self) -> None:
@@ -183,6 +194,12 @@ class WebApp:
                 self._hide_window()
             elif action == "show":
                 self._show_window()
+            elif action == "close":
+                if self._tray_unavailable or self._tray_icon is None:
+                    self.shutdown()
+                    return
+                else:
+                    self._hide_window()
             elif action == "exit":
                 self.shutdown()
                 return
@@ -350,7 +367,7 @@ class WebApp:
 
         if self._closing:
             return True
-        self.enqueue_native_action("exit" if self._tray_unavailable else "hide")
+        self.enqueue_native_action("close")
         # False cancels the native close. The dispatcher either hides the
         # window or performs a real, explicitly flagged shutdown.
         return False
@@ -360,8 +377,17 @@ class WebApp:
             if self._closing:
                 return {"ok": True, "state": self.controller.get_state()}
             self._closing = True
-        self._native_stop_event.set()
-        self.controller.shutdown()
+
+        try:
+            self._native_stop_event.set()
+        except Exception:
+            pass
+
+        try:
+            self.controller.shutdown()
+        except Exception:
+            pass
+
         icon = self._tray_icon
         thread = self._tray_thread
         self._tray_icon = None
@@ -372,7 +398,11 @@ class WebApp:
             except Exception:
                 pass
         if thread is not None and thread is not threading.current_thread() and thread.is_alive():
-            thread.join(timeout=2.0)
+            try:
+                thread.join(timeout=2.0)
+            except Exception:
+                pass
+
         dispatcher = self._native_dispatcher_thread
         self._native_dispatcher_thread = None
         if (
@@ -380,23 +410,38 @@ class WebApp:
             and dispatcher is not threading.current_thread()
             and dispatcher.is_alive()
         ):
-            dispatcher.join(timeout=2.0)
-        window = self.window
-        if window is not None:
             try:
-                window.destroy()
+                dispatcher.join(timeout=2.0)
             except Exception:
                 pass
+
+        window = self.window
+        self.window = None
+        if window is not None:
+            events = getattr(window, "events", None)
+            shown_event = getattr(events, "shown", None)
+            if shown_event is not None and hasattr(shown_event, "is_set"):
+                if shown_event.is_set():
+                    try:
+                        window.destroy()
+                    except Exception:
+                        pass
+            elif hasattr(window, "destroy"):
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
+
         return {"ok": True, "state": self.controller.get_state()}
 
     def run(self) -> int:
-        if webview is None:
-            raise WebViewUnavailable("pywebview 未安装；请安装 pywebview 与 WebView2 Runtime")
-        self.create_window()
-        self._start_native_dispatcher()
-        self.setup_tray()
-        self.controller.start()
         try:
+            if webview is None:
+                raise WebViewUnavailable("pywebview 未安装；请安装 pywebview 与 WebView2 Runtime")
+            self.create_window()
+            self._start_native_dispatcher()
+            self.setup_tray()
+            self.controller.start()
             # Explicit EdgeChromium selects WebView2 on Windows and yields a
             # clear exception when the runtime is missing.
             webview.start(gui="edgechromium", debug=False)
@@ -408,8 +453,8 @@ class WebApp:
 def run_web_app(application_dir: Path, *, silent: bool = False) -> int:
     """Run the app and convert backend failures into a native error dialog."""
 
-    app = WebApp(application_dir, silent=silent)
     try:
+        app = WebApp(application_dir, silent=silent)
         return app.run()
     except WebViewUnavailable as exc:
         show_webview_error(exc)

@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover - non-Windows development environments
 TASKS_FILE = "tasks.json"
 CONFIG_FILE = "config.json"
 MUSIC_DIRECTORIES = ("mp3", "changyong")
-ALLOWED_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".wma", ".aac")
+ALLOWED_EXTENSIONS = (".mp3", ".wav", ".flac", ".ogg")
 SCHEDULE_GRACE_SECONDS = 90
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_APP_NAME = "MusicSchedulerByStudent"
@@ -85,8 +85,12 @@ def calculate_task_end_at(task: Mapping[str, Any], started_at: datetime) -> date
 
     if task.get("mode", "song") != "duration":
         return None
+    raw_end = task.get("end_time", "")
+    normalized = TaskStore.normalize_clock(raw_end)
+    if not normalized:
+        return None
     try:
-        end_clock = datetime.strptime(str(task.get("end_time", "")), "%H:%M:%S").time()
+        end_clock = datetime.strptime(normalized, "%H:%M:%S").time()
     except (TypeError, ValueError):
         return None
 
@@ -229,7 +233,10 @@ class TaskStore:
         task["files"] = files
 
         raw_mode = raw_task.get("mode", "song")
-        mode = raw_mode if raw_mode in {"song", "duration"} else "song"
+        if isinstance(raw_mode, str) and raw_mode in {"song", "duration"}:
+            mode = raw_mode
+        else:
+            mode = "song"
         if "mode" in raw_task and raw_mode != mode:
             lossy += 1
         task["mode"] = mode
@@ -393,9 +400,10 @@ class PlaybackEngine:
             if self._pygame is None:
                 self.audio_error = "pygame 未安装"
                 return False
+            mixer_initialized = False
             try:
-                self._pygame.init()
                 self._pygame.mixer.init()
+                mixer_initialized = True
                 self._pygame.mixer.music.set_volume(1.0)
                 self._mixer_ready = True
                 self.audio_error = None
@@ -403,6 +411,11 @@ class PlaybackEngine:
             except Exception as exc:
                 self.audio_error = str(exc)
                 self._mixer_ready = False
+                if mixer_initialized:
+                    try:
+                        self._pygame.mixer.quit()
+                    except Exception:
+                        pass
                 return False
 
     def _resolve(self, path_value: str | os.PathLike[str]) -> Path:
@@ -428,46 +441,85 @@ class PlaybackEngine:
         self._close_file()
 
     def _play_path(self, path_value: str | os.PathLike[str]) -> tuple[bool, str]:
-        path = self._resolve(path_value)
+        try:
+            path = self._resolve(path_value)
+        except Exception as exc:
+            return False, f"无效路径: {exc}"
+
+        if path.suffix.casefold() not in ALLOWED_EXTENSIONS:
+            return False, f"不支持的音频格式: {path.suffix}"
+
         if not path.exists() or not path.is_file():
             return False, "文件不存在"
         if not self._mixer_ready and not self.initialize():
             return False, self.audio_error or "音频设备不可用"
         try:
-            try:
-                if self._pygame.mixer.music.get_busy():
-                    self._pygame.mixer.music.stop()
-            except Exception:
-                pass
-            self._unload()
+            if self._pygame.mixer.music.get_busy():
+                self._pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self._unload()
+        file_obj = None
+        try:
             file_obj = path.open("rb")
+            self._current_file = file_obj
             self._pygame.mixer.music.load(file_obj)
             self._pygame.mixer.music.play()
-            self._current_file = file_obj
             self.current_track_path = str(path)
             return True, ""
         except Exception as exc:
-            self._close_file()
+            if self._mixer_ready:
+                try:
+                    self._pygame.mixer.music.unload()
+                except Exception:
+                    pass
+            if file_obj is not None:
+                try:
+                    file_obj.close()
+                except Exception:
+                    pass
+            self._current_file = None
             self.current_track_path = None
             return False, str(exc)
 
     def play_manual(self, path_value: str) -> tuple[bool, str]:
         with self._lock:
-            self.is_playlist_active = False
-            self.playlist_queue = []
-            self.current_track_index = 0
-            self.current_task_name = ""
-            self.current_task_end_at = None
-            return self._play_path(path_value)
+            self._stop_locked()
+            task = {
+                "name": "手动播放",
+                "mode": "song",
+                "files": [path_value],
+            }
+            result = self.start_playlist(task)
+            if result.get("ok"):
+                return True, result.get("message", "")
+            self._stop_locked()
+            return False, result.get("message", "播放失败")
 
-    def start_playlist(self, task: Mapping[str, Any], started_at: datetime | None = None) -> dict[str, Any]:
+    def start_playlist(
+        self,
+        task: Mapping[str, Any],
+        started_at: datetime | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
+            current_time = now or datetime.now()
+            effective_start = started_at or current_time
+            mode = str(task.get("mode", "song"))
+            end_at = calculate_task_end_at(task, effective_start)
+            if mode == "duration" and end_at is not None and current_time >= end_at:
+                return {
+                    "ok": False,
+                    "event": "expired",
+                    "message": f"任务未播放：已超过设定结束时间（{task.get('name', '未命名任务')}）",
+                }
             self.playlist_queue = [str(path) for path in task.get("files", [])]
             self.current_track_index = 0
             self.is_playlist_active = True
             self.current_task_name = str(task.get("name", "未命名任务"))
-            self.current_task_mode = str(task.get("mode", "song"))
-            self.current_task_end_at = calculate_task_end_at(task, started_at or datetime.now())
+            self.current_task_mode = mode
+            self.current_task_end_at = end_at
             result = self._play_next_locked()
             return result
 
@@ -577,7 +629,7 @@ class SchedulerService:
     def __init__(
         self,
         tasks_provider: Callable[[], list[Mapping[str, Any]]],
-        on_due: Callable[[Mapping[str, Any], int], None],
+        on_due: Callable[[Mapping[str, Any], int, datetime], None],
         on_tick: Callable[[datetime], None] | None = None,
         *,
         interval: float = 0.5,
@@ -589,6 +641,7 @@ class SchedulerService:
         self.interval = interval
         self.grace_seconds = grace_seconds
         self.last_tick_dt: datetime | None = None
+        self.evaluated_max_dt: datetime | None = None
         self.running = False
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -617,7 +670,7 @@ class SchedulerService:
             current = now or datetime.now()
             previous = self.last_tick_dt
             if previous is not None and current < previous:
-                # A rollback must reset the baseline without replaying old work.
+                # A rollback must reset the baseline without lowering evaluated_max_dt.
                 self.last_tick_dt = current
                 if self.on_tick is not None:
                     self.on_tick(current)
@@ -627,8 +680,11 @@ class SchedulerService:
                 interval_start = current.replace(microsecond=0) - timedelta(microseconds=1)
             else:
                 interval_start = previous
+
+            high_watermark = self.evaluated_max_dt if self.evaluated_max_dt is not None else interval_start
+            effective_start = max(interval_start, high_watermark)
             grace_start = current - timedelta(seconds=self.grace_seconds)
-            scan_start = max(interval_start, grace_start)
+            scan_start = max(effective_start, grace_start)
             tasks = list(self.tasks_provider())
             due_candidates: list[tuple[datetime, int, Mapping[str, Any]]] = []
             candidate_date = scan_start.date()
@@ -639,16 +695,19 @@ class SchedulerService:
                     candidate = self._candidate_datetime(task, candidate_date)
                     if candidate is None:
                         continue
-                    if interval_start < candidate <= current and candidate >= grace_start:
+                    if effective_start < candidate <= current and candidate >= grace_start:
                         due_candidates.append((candidate, task_index, task))
                 candidate_date += timedelta(days=1)
 
-            # Advance the baseline before invoking potentially failing playback.
+            # Advance the baseline and evaluated max before invoking potentially failing playback.
             self.last_tick_dt = current
+            if self.evaluated_max_dt is None or current > self.evaluated_max_dt:
+                self.evaluated_max_dt = current
+
             selected: Mapping[str, Any] | None = None
             if due_candidates:
-                _, _, selected = max(due_candidates, key=lambda item: (item[0], item[1]))
-                self.on_due(selected, max(item[1] for item in due_candidates if item[2] is selected))
+                candidate_dt, selected_index, selected = max(due_candidates, key=lambda item: (item[0], item[1]))
+                self.on_due(selected, selected_index, candidate_dt)
             if self.on_tick is not None:
                 self.on_tick(current)
             return selected
@@ -705,28 +764,36 @@ class MusicPlayerController:
         self._lock = threading.RLock()
         self.running = True
         self._closing = False
+        self.tasks_revision = 0
         self.music_files: list[dict[str, str]] = []
         self.status_message = "就绪"
         self.status_tone = "neutral"
         self._startup_enabled = False
         self.first_run_help = False
-        self.config = self._load_config()
-        self.store = TaskStore(self.application_dir)
-        self.tasks = self.store.load()
-        self.tasks.sort(key=lambda task: task.get("time", "") if isinstance(task, dict) else "")
-        self.store.tasks = _deepcopy_tasks(self.tasks)
-        self.playback = PlaybackEngine(
-            self.application_dir,
-            initialize_audio=initialize_audio,
-        )
-        self.scheduler = SchedulerService(
-            self._get_tasks,
-            self._on_due_task,
-            self._on_scheduler_tick,
-        )
-        self.refresh_music(emit=False)
-        self._startup_enabled = self._read_startup_status()
-        self._set_initial_status()
+        self.playback: PlaybackEngine | None = None
+        self.scheduler: SchedulerService | None = None
+        self.store: TaskStore | None = None
+        try:
+            self.config = self._load_config()
+            self.store = TaskStore(self.application_dir)
+            self.tasks = self.store.load()
+            self.tasks.sort(key=lambda task: task.get("time", "") if isinstance(task, dict) else "")
+            self.store.tasks = _deepcopy_tasks(self.tasks)
+            self.playback = PlaybackEngine(
+                self.application_dir,
+                initialize_audio=initialize_audio,
+            )
+            self.scheduler = SchedulerService(
+                self._get_tasks,
+                self._on_due_task,
+                self._on_scheduler_tick,
+            )
+            self.refresh_music(emit=False)
+            self._startup_enabled = self._read_startup_status()
+            self._set_initial_status()
+        except Exception:
+            self.shutdown()
+            raise
 
     def _load_config(self) -> dict[str, Any]:
         config_path = self.application_dir / CONFIG_FILE
@@ -808,16 +875,17 @@ class MusicPlayerController:
             return {
                 "clock": now.strftime("%H:%M:%S"),
                 "tasks": _deepcopy_tasks(self.tasks),
+                "tasks_revision": self.tasks_revision,
                 "music_files": copy.deepcopy(self.music_files),
                 "startup_enabled": bool(self._startup_enabled),
-                "playback": self.playback.state(),
+                "playback": self.playback.state() if self.playback is not None else {},
                 "next_run": next_run,
                 "status": {"message": self.status_message, "tone": self.status_tone},
                 "store": {
-                    "load_state": self.store.load_state,
-                    "read_only": self.store.load_state != "ready",
-                    "backup_path": self.store.backup_path.name if self.store.backup_path else None,
-                    "error": self.store.last_error,
+                    "load_state": self.store.load_state if self.store else "pending",
+                    "read_only": (self.store.load_state != "ready") if self.store else True,
+                    "backup_path": self.store.backup_path.name if (self.store and self.store.backup_path) else None,
+                    "error": self.store.last_error if self.store else None,
                 },
                 "first_run_help": bool(self.first_run_help),
                 "running": bool(self.running),
@@ -881,7 +949,7 @@ class MusicPlayerController:
         if start_time is None:
             return None, "开始时间格式无效，应为 HH:MM"
         mode = raw.get("mode", existing.get("mode", "song") if existing else "song")
-        if mode not in {"song", "duration"}:
+        if not isinstance(mode, str) or mode not in {"song", "duration"}:
             return None, "播放模式无效"
         end_time_value = raw.get("end_time", existing.get("end_time", "") if existing else "")
         end_time = TaskStore.normalize_clock(end_time_value) if end_time_value else ""
@@ -902,12 +970,25 @@ class MusicPlayerController:
         files_value = raw.get("files", existing.get("files", []) if existing else [])
         if not isinstance(files_value, list):
             return None, "歌曲列表必须是数组"
+        existing_files: set[str] = set()
+        if existing and isinstance(existing.get("files"), list):
+            for item in existing["files"]:
+                existing_files.add(str(item))
+                try:
+                    existing_files.add(self.store.make_portable_music_path(item))
+                except Exception:
+                    pass
         files: list[str] = []
         for path_value in files_value:
             if not isinstance(path_value, str) or not path_value.strip():
                 return None, "歌曲路径无效"
             try:
-                files.append(self.store.make_portable_music_path(path_value))
+                portable = self.store.make_portable_music_path(path_value)
+                suffix = Path(portable).suffix.casefold()
+                if portable not in existing_files and str(path_value) not in existing_files:
+                    if suffix not in ALLOWED_EXTENSIONS:
+                        return None, f"不支持的音频格式: {suffix}"
+                files.append(portable)
             except Exception as exc:
                 return None, f"歌曲路径无效: {exc}"
         if not files:
@@ -955,6 +1036,12 @@ class MusicPlayerController:
                 return self._read_only_result()
             if not isinstance(payload, Mapping):
                 return {"ok": False, "error": "任务数据必须是对象", "state": self.get_state()}
+            expected_revision = payload.get("expected_revision")
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                return {"ok": False, "error": "任务版本无效", "state": self.get_state()}
+            if expected_revision != self.tasks_revision:
+                return {"ok": False, "error": "任务列表已更新，请重新操作", "state": self.get_state()}
+
             raw_task = payload.get("task") if isinstance(payload.get("task"), Mapping) else payload
             index_value = payload.get("index")
             index = self._strict_index(index_value) if index_value is not None else None
@@ -980,6 +1067,7 @@ class MusicPlayerController:
                 self.store.tasks = _deepcopy_tasks(previous)
                 self._set_status("任务设置未能保存，请检查程序目录的写入权限或磁盘空间。", "danger")
                 return {"ok": False, "error": self.store.last_error or "保存失败", "state": self.get_state()}
+            self.tasks_revision += 1
             self._set_status(
                 f"任务{'修改' if index is not None else '创建'}成功：{normalized['name']}",
                 "success",
@@ -987,10 +1075,14 @@ class MusicPlayerController:
             )
             return {"ok": True, "task": copy.deepcopy(normalized), "state": self.get_state()}
 
-    def delete_task(self, index_value: Any) -> dict[str, Any]:
+    def delete_task(self, index_value: Any, expected_revision: Any = None) -> dict[str, Any]:
         with self._lock:
             if self.store.load_state != "ready":
                 return self._read_only_result()
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                return {"ok": False, "error": "任务版本无效", "state": self.get_state()}
+            if expected_revision != self.tasks_revision:
+                return {"ok": False, "error": "任务列表已更新，请重新操作", "state": self.get_state()}
             index = self._strict_index(index_value)
             if index is None or index < 0 or index >= len(self.tasks):
                 return {"ok": False, "error": "任务索引无效", "state": self.get_state()}
@@ -1001,14 +1093,19 @@ class MusicPlayerController:
                 self.store.tasks = _deepcopy_tasks(previous)
                 self._set_status("任务设置未能保存，请检查程序目录的写入权限或磁盘空间。", "danger")
                 return {"ok": False, "error": self.store.last_error or "保存失败", "state": self.get_state()}
+            self.tasks_revision += 1
             name = str(deleted.get("name", "未命名任务"))
             self._set_status(f"已删除任务：{name}", "success", toast=True)
             return {"ok": True, "deleted": copy.deepcopy(deleted), "state": self.get_state()}
 
-    def set_task_enabled(self, index_value: Any, enabled: Any) -> dict[str, Any]:
+    def set_task_enabled(self, index_value: Any, enabled: Any, expected_revision: Any = None) -> dict[str, Any]:
         with self._lock:
             if self.store.load_state != "ready":
                 return self._read_only_result()
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                return {"ok": False, "error": "任务版本无效", "state": self.get_state()}
+            if expected_revision != self.tasks_revision:
+                return {"ok": False, "error": "任务列表已更新，请重新操作", "state": self.get_state()}
             index = self._strict_index(index_value)
             if index is None or index < 0 or index >= len(self.tasks):
                 return {"ok": False, "error": "任务索引无效", "state": self.get_state()}
@@ -1021,6 +1118,7 @@ class MusicPlayerController:
                 self.store.tasks = _deepcopy_tasks(previous)
                 self._set_status("任务设置未能保存，请检查程序目录的写入权限或磁盘空间。", "danger")
                 return {"ok": False, "error": self.store.last_error or "保存失败", "state": self.get_state()}
+            self.tasks_revision += 1
             name = str(self.tasks[index].get("name", "未命名任务"))
             self._set_status(f"已{'启用' if enabled else '暂停'}任务：{name}", "success", toast=True)
             return {"ok": True, "state": self.get_state()}
@@ -1079,6 +1177,8 @@ class MusicPlayerController:
         with self._lock:
             if not isinstance(path_value, str) or not path_value.strip():
                 return {"ok": False, "error": "歌曲路径无效", "state": self.get_state()}
+            if self.playback is None:
+                return {"ok": False, "error": "音频播放器未初始化", "state": self.get_state()}
             success, message = self.playback.play_manual(path_value)
             if success:
                 self._set_status(f"正在播放：{Path(path_value).name}", "playing", toast=True)
@@ -1142,16 +1242,23 @@ class MusicPlayerController:
                     return {"ok": False, "error": str(exc), "state": self.get_state()}
             return {"ok": True, "state": self.get_state()}
 
-    def _on_due_task(self, task: Mapping[str, Any], _task_index: int) -> None:
+    def _on_due_task(self, task: Mapping[str, Any], _task_index: int, scheduled_at: datetime) -> None:
         with self._lock:
-            if not self.running:
+            if not self.running or self.playback is None:
                 return
-            result = self.playback.start_playlist(task)
-            self._set_status(result.get("message", "任务已触发"), "playing" if result.get("ok") else "danger", toast=True)
+            result = self.playback.start_playlist(task, started_at=scheduled_at)
+            if result.get("event") == "expired":
+                self._set_status(result.get("message", "任务已过期"), "warning", toast=True)
+            else:
+                self._set_status(
+                    result.get("message", "任务已触发"),
+                    "playing" if result.get("ok") else "danger",
+                    toast=True,
+                )
 
     def _on_scheduler_tick(self, now: datetime) -> None:
         with self._lock:
-            if not self.running:
+            if not self.running or self.playback is None:
                 return
             result = self.playback.tick(now)
             if result is not None:
@@ -1168,8 +1275,16 @@ class MusicPlayerController:
                 return
             self._closing = True
             self.running = False
-        self.scheduler.stop()
-        self.playback.shutdown()
+        if self.scheduler is not None:
+            try:
+                self.scheduler.stop()
+            except Exception:
+                pass
+        if self.playback is not None:
+            try:
+                self.playback.shutdown()
+            except Exception:
+                pass
 
 
 __all__ = [

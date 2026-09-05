@@ -25,11 +25,13 @@
   let dialogKind = null;
   let draggedSongIndex = null;
   let mockApi = null;
+  let taskWritePending = false;
 
   function emptyState() {
     return {
       clock: "00:00:00",
       tasks: [],
+      tasks_revision: 0,
       music_files: [],
       startup_enabled: false,
       playback: { active: false, task_name: "", mode: "song", current_track: null, queue_length: 0 },
@@ -139,8 +141,14 @@
   }
 
   function renderState(nextState) {
+    if (nextState && typeof nextState.tasks_revision === "number" && typeof state.tasks_revision === "number") {
+      if (nextState.tasks_revision < state.tasks_revision) {
+        return;
+      }
+    }
     state = { ...emptyState(), ...(nextState || {}) };
     state.tasks = Array.isArray(nextState?.tasks) ? nextState.tasks : [];
+    state.tasks_revision = typeof nextState?.tasks_revision === "number" ? nextState.tasks_revision : (state.tasks_revision || 0);
     state.music_files = Array.isArray(nextState?.music_files) ? nextState.music_files : [];
     state.playback = { ...emptyState().playback, ...(nextState?.playback || {}) };
     state.status = { ...emptyState().status, ...(nextState?.status || {}) };
@@ -154,7 +162,7 @@
     if (startupSwitch) startupSwitch.checked = Boolean(state.startup_enabled);
     const createButton = app.querySelector('[data-action="create"]');
     if (createButton) {
-      createButton.disabled = Boolean(state.store.read_only);
+      createButton.disabled = Boolean(state.store.read_only) || taskWritePending;
       createButton.title = state.store.read_only ? "任务数据只读保护中" : "创建新任务";
     }
     renderStatus();
@@ -186,6 +194,11 @@
   }
 
   function renderTasks() {
+    const createButton = app.querySelector('[data-action="create"]');
+    if (createButton) {
+      createButton.disabled = Boolean(state.store.read_only) || taskWritePending;
+      createButton.title = state.store.read_only ? "任务数据只读保护中" : "创建新任务";
+    }
     const list = document.getElementById("task-list");
     if (!state.tasks.length) {
       list.innerHTML = `<div class="empty-state">还没有播放任务。<br><span class="form-hint">点击“创建新任务”开始设置时间、歌曲和星期。</span></div>`;
@@ -200,9 +213,9 @@
       return `<article class="task-row" data-task-index="${index}" data-task="${escapeHtml(name)}">
         <div class="task-time">${escapeHtml(String(task.time || "").slice(0, 5))}</div>
         <div class="task-copy"><div class="task-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div><div class="task-meta"><span class="tag">${mode}</span><span>${escapeHtml(end)}</span><span>${escapeHtml(weekdays)}</span></div></div>
-        <div class="inline-actions"><label class="switch"><span class="sr-only">启用${escapeHtml(name)}</span><input type="checkbox" data-task-switch ${enabled ? "checked" : ""}></label>
-          <button type="button" class="mini-button" data-action="edit" aria-label="修改${escapeHtml(name)}">${svgIcon("pencil")}<span>修改</span></button>
-          <button type="button" class="mini-button" data-action="delete" aria-label="删除${escapeHtml(name)}">${svgIcon("trash")}<span>删除</span></button></div>
+        <div class="inline-actions"><label class="switch"><span class="sr-only">启用${escapeHtml(name)}</span><input type="checkbox" data-task-switch ${enabled ? "checked" : ""} ${taskWritePending ? "disabled" : ""}></label>
+          <button type="button" class="mini-button" data-action="edit" aria-label="修改${escapeHtml(name)}" ${taskWritePending ? "disabled" : ""}>${svgIcon("pencil")}<span>修改</span></button>
+          <button type="button" class="mini-button" data-action="delete" aria-label="删除${escapeHtml(name)}" ${taskWritePending ? "disabled" : ""}>${svgIcon("trash")}<span>删除</span></button></div>
       </article>`;
     }).join("");
   }
@@ -266,7 +279,9 @@
     const defaultFiles = existing ? [...(existing.files || [])] : state.music_files.slice(0, 2).map((item) => item.path);
     wizard = {
       index,
+      expected_revision: state.tasks_revision,
       step: 0,
+      error: "",
       data: {
         time: existing?.time?.slice(0, 5) || "09:00",
         mode: existing?.mode === "duration" ? "duration" : "song",
@@ -285,6 +300,8 @@
 
   function renderWizard(errorMessage = "") {
     if (!wizard) return;
+    if (errorMessage) wizard.error = errorMessage;
+    const currentError = errorMessage || wizard.error || "";
     const titlePrefix = wizard.index === null ? "创建任务" : "修改任务";
     dialog.classList.toggle("wide-dialog", wizard.step === 1);
     const data = wizard.data;
@@ -293,7 +310,7 @@
         <div class="time-row"><div class="form-group"><label class="form-label" for="start-time">开始时间</label><div class="time-control"><input class="time-field" id="start-time" type="time" value="${escapeHtml(data.time)}" required><div class="stepper"><button type="button" data-time-adjust="1" data-time-target="start-time" aria-label="开始时间增加一分钟">▲</button><button type="button" data-time-adjust="-1" data-time-target="start-time" aria-label="开始时间减少一分钟">▼</button></div></div></div>
           <div class="form-group ${data.mode === "duration" ? "" : "is-hidden"}" id="end-time-group"><label class="form-label" for="end-time">结束时间</label><div class="time-control"><input class="time-field" id="end-time" type="time" value="${escapeHtml(data.end_time)}"><div class="stepper"><button type="button" data-time-adjust="1" data-time-target="end-time" aria-label="结束时间增加一分钟">▲</button><button type="button" data-time-adjust="-1" data-time-target="end-time" aria-label="结束时间减少一分钟">▼</button></div></div></div></div>
         <fieldset class="form-group"><legend class="form-label">播放行为</legend><label class="mode-choice"><input type="radio" name="play-mode" value="song" ${data.mode === "song" ? "checked" : ""}><span><strong>固定曲目</strong><br><span class="form-hint">按顺序播放一次，全部播放完毕后停止</span></span></label><label class="mode-choice"><input type="radio" name="play-mode" value="duration" ${data.mode === "duration" ? "checked" : ""}><span><strong>固定时长</strong><br><span class="form-hint">循环播放歌单，到结束时间自动停止</span></span></label><label class="mode-choice ${data.mode === "duration" ? "" : "is-hidden"}" id="next-day-choice"><input id="next-day" type="checkbox" ${data.end_next_day ? "checked" : ""}><span>次日结束</span></label></fieldset>
-        <div class="form-hint" id="time-feedback">${data.mode === "duration" ? `将在 ${escapeHtml(data.time)} 开始，循环播放至 ${escapeHtml(data.end_time)}` : `将在 ${escapeHtml(data.time)} 开始，所选歌曲播完后停止`}</div>${errorMessage ? `<div class="field-error" role="alert">${escapeHtml(errorMessage)}</div>` : ""}
+        <div class="form-hint" id="time-feedback">${data.mode === "duration" ? `将在 ${escapeHtml(data.time)} 开始，循环播放至 ${escapeHtml(data.end_time)}` : `将在 ${escapeHtml(data.time)} 开始，所选歌曲播完后停止`}</div>${currentError ? `<div class="field-error" role="alert">${escapeHtml(currentError)}</div>` : ""}
         <div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="cancel">取消</button><div class="right-actions"><button type="button" class="primary-button" data-dialog-action="next">下一步${svgIcon("arrow-right")}</button></div></div>`;
     } else if (wizard.step === 1) {
       const selected = data.files || [];
@@ -303,22 +320,36 @@
       }).join("") || `<div class="empty-state">音乐库为空，请先刷新音乐列表。</div>`;
       const selectedRows = selected.map((path, index) => {
         const track = trackInfo(path);
-        return `<div class="song-row" draggable="true" data-song-index="${index}"><span class="drag-handle" aria-hidden="true">${svgIcon("grip")}</span><span class="song-name" title="${escapeHtml(track.name)}">${index + 1}. ${escapeHtml(track.name)}</span><button type="button" data-song-up="${index}" aria-label="上移 ${escapeHtml(track.name)}" ${index === 0 ? "disabled" : ""}>${svgIcon("arrow-up")}</button><button type="button" data-song-down="${index}" aria-label="下移 ${escapeHtml(track.name)}" ${index === selected.length - 1 ? "disabled" : ""}>${svgIcon("arrow-down")}</button><button type="button" data-song-remove="${index}" aria-label="移除 ${escapeHtml(track.name)}">${svgIcon("x")}</button></div>`;
+        const ext = String(path).split(".").pop()?.toLowerCase();
+        const isSupported = ["mp3", "wav", "flac", "ogg"].includes(ext);
+        const badge = isSupported ? "" : ` <span class="tag tag-danger">格式不支持</span>`;
+        return `<div class="song-row" draggable="true" data-song-index="${index}"><span class="drag-handle" aria-hidden="true">${svgIcon("grip")}</span><span class="song-name" title="${escapeHtml(track.name)}">${index + 1}. ${escapeHtml(track.name)}${badge}</span><button type="button" data-song-up="${index}" aria-label="上移 ${escapeHtml(track.name)}" ${index === 0 ? "disabled" : ""}>${svgIcon("arrow-up")}</button><button type="button" data-song-down="${index}" aria-label="下移 ${escapeHtml(track.name)}" ${index === selected.length - 1 ? "disabled" : ""}>${svgIcon("arrow-down")}</button><button type="button" data-song-remove="${index}" aria-label="移除 ${escapeHtml(track.name)}">${svgIcon("x")}</button></div>`;
       }).join("") || `<div class="empty-state">请至少选择一首歌曲</div>`;
-      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 选择歌曲`, "从音乐库添加，并调整实际播放顺序", 1)}<div class="song-columns"><section class="song-column"><div class="song-column-title">音乐库 · 点击添加</div>${library}</section><section class="song-column"><div class="song-column-title">播放顺序 · 已选 ${selected.length} 首</div>${selectedRows}</section></div>${errorMessage ? `<div class="field-error" role="alert">${escapeHtml(errorMessage)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="secondary-button" data-dialog-action="cancel">取消</button><button type="button" class="primary-button" data-dialog-action="next" ${selected.length ? "" : "disabled"}>下一步${svgIcon("arrow-right")}</button></div></div>`;
+      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 选择歌曲`, "从音乐库添加，并调整实际播放顺序", 1)}<div class="song-columns"><section class="song-column"><div class="song-column-title">音乐库 · 点击添加</div>${library}</section><section class="song-column"><div class="song-column-title">播放顺序 · 已选 ${selected.length} 首</div>${selectedRows}</section></div>${currentError ? `<div class="field-error" role="alert">${escapeHtml(currentError)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="secondary-button" data-dialog-action="cancel">取消</button><button type="button" class="primary-button" data-dialog-action="next" ${selected.length ? "" : "disabled"}>下一步${svgIcon("arrow-right")}</button></div></div>`;
     } else if (wizard.step === 2) {
-      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 播放日期`, `${escapeHtml(data.time)} 开始 · 已选择 ${(data.files || []).length} 首歌曲`, 2)}<fieldset class="form-group"><legend class="form-label">选择需要播放的星期</legend><div class="week-grid">${days.map((day, index) => `<label><input type="checkbox" data-weekday="${index}" ${data.weekdays.includes(index) ? "checked" : ""}><span>${day}</span></label>`).join("")}</div></fieldset>${errorMessage ? `<div class="field-error" role="alert">${escapeHtml(errorMessage)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="secondary-button" data-dialog-action="cancel">取消</button><button type="button" class="primary-button" data-dialog-action="next">下一步${svgIcon("arrow-right")}</button></div></div>`;
+      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 播放日期`, `${escapeHtml(data.time)} 开始 · 已选择 ${(data.files || []).length} 首歌曲`, 2)}<fieldset class="form-group"><legend class="form-label">选择需要播放的星期</legend><div class="week-grid">${days.map((day, index) => `<label><input type="checkbox" data-weekday="${index}" ${data.weekdays.includes(index) ? "checked" : ""}><span>${day}</span></label>`).join("")}</div></fieldset>${currentError ? `<div class="field-error" role="alert">${escapeHtml(currentError)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="secondary-button" data-dialog-action="cancel">取消</button><button type="button" class="primary-button" data-dialog-action="next">下一步${svgIcon("arrow-right")}</button></div></div>`;
     } else {
-      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 任务命名`, "最后一步，名称会显示在任务列表与播放状态中", 3)}<div class="form-group"><label class="form-label" for="task-name">任务名称</label><input class="field" id="task-name" maxlength="80" value="${escapeHtml(data.name)}" placeholder="例如：晨间钢琴" required></div><div class="form-hint">任务会自动保存到本地，可随时修改、停用或删除。</div>${errorMessage ? `<div class="field-error" role="alert">${escapeHtml(errorMessage)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="primary-button" data-dialog-action="finish">${svgIcon("check")}完成</button></div></div>`;
+      dialog.innerHTML = `${dialogHeader(`${titlePrefix} · 任务命名`, "最后一步，名称会显示在任务列表与播放状态中", 3)}<div class="form-group"><label class="form-label" for="task-name">任务名称</label><input class="field" id="task-name" maxlength="80" value="${escapeHtml(data.name)}" placeholder="例如：晨间钢琴" required></div><div class="form-hint">任务会自动保存到本地，可随时修改、停用或删除。</div>${currentError ? `<div class="field-error" role="alert">${escapeHtml(currentError)}</div>` : ""}<div class="dialog-actions"><button type="button" class="secondary-button" data-dialog-action="back">${svgIcon("arrow-left")}上一步</button><div class="right-actions"><button type="button" class="primary-button" data-dialog-action="finish" ${taskWritePending ? "disabled" : ""}>${svgIcon("check")}完成</button></div></div>`;
     }
     focusDialog();
+  }
+
+  function saveWizardTimeInputs() {
+    if (!wizard || wizard.step !== 0) return;
+    const start = dialog.querySelector("#start-time")?.value;
+    const end = dialog.querySelector("#end-time")?.value;
+    const nextDay = dialog.querySelector("#next-day");
+    if (typeof start === "string") wizard.data.time = start;
+    if (typeof end === "string") wizard.data.end_time = end;
+    if (nextDay) wizard.data.end_next_day = Boolean(nextDay.checked);
   }
 
   function collectWizardStep() {
     if (!wizard) return true;
     if (wizard.step === 0) {
-      const start = dialog.querySelector("#start-time")?.value || "";
-      const end = dialog.querySelector("#end-time")?.value || "";
+      saveWizardTimeInputs();
+      const start = wizard.data.time || "";
+      const end = wizard.data.end_time || "";
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) {
         renderWizard("请输入有效的开始时间。");
         return false;
@@ -328,15 +359,11 @@
           renderWizard("固定时长模式必须设置有效的结束时间。");
           return false;
         }
-        const nextDay = Boolean(dialog.querySelector("#next-day")?.checked);
-        if (!nextDay && end <= start) {
+        if (!wizard.data.end_next_day && end <= start) {
           renderWizard("结束时间不晚于开始时间；如需跨午夜，请勾选“次日结束”。");
           return false;
         }
       }
-      wizard.data.time = start;
-      wizard.data.end_time = wizard.data.mode === "duration" ? end : "";
-      wizard.data.end_next_day = Boolean(dialog.querySelector("#next-day")?.checked);
     } else if (wizard.step === 1) {
       if (!wizard.data.files.length) {
         renderWizard("请至少选择一首歌曲。");
@@ -355,15 +382,45 @@
   }
 
   async function finishWizard() {
-    if (!collectWizardStep()) return;
-    const payload = { task: { ...wizard.data } };
-    if (wizard.index !== null) payload.index = wizard.index;
-    const response = await invoke("save_task", payload);
-    if (!applyResponse(response)) return;
-    const savedName = wizard.data.name || "未命名任务";
-    closeDialog();
-    setView("tasks");
-    showToast(`已保存“${savedName}”`, "success");
+    if (taskWritePending) return;
+    if (!wizard || !collectWizardStep()) return;
+    const submittedWizard = wizard;
+    const submittedName = submittedWizard.data.name || "未命名任务";
+    const payload = {
+      task: { ...submittedWizard.data },
+      expected_revision: submittedWizard.expected_revision,
+    };
+    if (submittedWizard.index !== null) payload.index = submittedWizard.index;
+
+    taskWritePending = true;
+    renderWizard();
+
+    try {
+      const response = await invoke("save_task", payload);
+      const next = responseState(response);
+      if (next) renderState(next);
+      if (response && response.ok === false) {
+        if (wizard === submittedWizard) {
+          renderWizard(response.error || "保存失败，请检查输入");
+        } else {
+          showToast(response.error || "保存失败", "danger");
+        }
+        return;
+      }
+      if (wizard === submittedWizard) {
+        closeDialog();
+        setView("tasks");
+      }
+      showToast(`已保存“${submittedName}”`, "success");
+    } catch (err) {
+      if (wizard === submittedWizard) {
+        renderWizard(err?.message || "网络或桥接异常");
+      }
+    } finally {
+      taskWritePending = false;
+      renderTasks();
+      if (wizard) renderWizard();
+    }
   }
 
   function openHelp(forced = false) {
@@ -409,6 +466,13 @@
     const [hour, minute] = (input.value || "00:00").split(":").map(Number);
     const total = ((hour * 60 + minute + amount) % 1440 + 1440) % 1440;
     input.value = `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+    saveWizardTimeInputs();
+    const feedback = dialog.querySelector("#time-feedback");
+    if (feedback && wizard) {
+      feedback.textContent = wizard.data.mode === "duration"
+        ? `将在 ${escapeHtml(wizard.data.time)} 开始，循环播放至 ${escapeHtml(wizard.data.end_time)}`
+        : `将在 ${escapeHtml(wizard.data.time)} 开始，所选歌曲播完后停止`;
+    }
   }
 
   function moveSong(from, to) {
@@ -422,6 +486,7 @@
     const mockState = {
       ...emptyState(),
       clock: "08:24:16",
+      tasks_revision: 0,
       tasks: [
         { time: "09:00:00", mode: "song", end_time: "", end_next_day: false, files: ["mp3/晨光钢琴曲.mp3", "changyong/Coffee Shop Ambience.flac", "mp3/午后爵士.wav", "changyong/雨夜白噪音.ogg"], name: "晨间钢琴", weekdays: [0, 1, 2, 3, 4], enabled: true },
         { time: "12:20:00", mode: "duration", end_time: "13:00:00", end_next_day: false, files: ["mp3/晨光钢琴曲.mp3"], name: "午间轻音乐", weekdays: [0, 1, 2, 3, 4, 5, 6], enabled: true },
@@ -441,14 +506,39 @@
       get_state: async () => reply(),
       poll_events: async () => [],
       refresh_music: async () => reply(),
-      save_task: async (payload) => { const task = { ...payload.task, time: `${payload.task.time}:00`.slice(0, 8), end_time: payload.task.end_time ? `${payload.task.end_time}:00`.slice(0, 8) : "" }; if (payload.index === undefined) mockState.tasks.push(task); else mockState.tasks[payload.index] = task; return reply(); },
-      delete_task: async (index) => { mockState.tasks.splice(index, 1); return reply(); },
-      set_task_enabled: async (index, enabled) => { mockState.tasks[index].enabled = enabled; return reply(); },
+      save_task: async (payload) => {
+        if (!payload || payload.expected_revision !== mockState.tasks_revision) {
+          return { ok: false, error: "任务列表已更新，请重新操作", state: reply().state };
+        }
+        const raw = payload.task || payload;
+        const task = { ...raw, time: `${raw.time}:00`.slice(0, 8), end_time: raw.end_time ? `${raw.end_time}:00`.slice(0, 8) : "" };
+        if (payload.index === undefined) mockState.tasks.push(task);
+        else mockState.tasks[payload.index] = task;
+        mockState.tasks.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+        mockState.tasks_revision += 1;
+        return reply();
+      },
+      delete_task: async (index, expected_revision) => {
+        if (expected_revision !== mockState.tasks_revision) {
+          return { ok: false, error: "任务列表已更新，请重新操作", state: reply().state };
+        }
+        mockState.tasks.splice(index, 1);
+        mockState.tasks_revision += 1;
+        return reply();
+      },
+      set_task_enabled: async (index, enabled, expected_revision) => {
+        if (expected_revision !== mockState.tasks_revision) {
+          return { ok: false, error: "任务列表已更新，请重新操作", state: reply().state };
+        }
+        mockState.tasks[index].enabled = enabled;
+        mockState.tasks_revision += 1;
+        return reply();
+      },
       play_track: async (path) => { mockState.playback = { active: true, task_name: "手动播放", mode: "song", current_track: path, queue_length: 1 }; mockState.status = { message: `正在播放：${fileName(path)}`, tone: "playing" }; return reply(); },
       stop_playback: async () => { mockState.playback = emptyState().playback; mockState.status = { message: "播放已停止", tone: "neutral" }; return reply(); },
       set_startup: async (enabled) => { mockState.startup_enabled = enabled; return reply(); },
       acknowledge_first_help: async () => { mockState.first_run_help = false; return reply(); },
-      minimize: async () => reply(), hide: async () => reply(), show: async () => reply(), exit: async () => reply(),
+      minimize: async () => reply(), hide: async () => reply(), show: async () => reply(), close: async () => reply(), exit: async () => reply(),
     };
   }
 
@@ -462,8 +552,8 @@
       const action = dialogAction.dataset.dialogAction;
       if (action === "cancel") closeDialog();
       if (action === "help-done") { closeDialog(); invoke("acknowledge_first_help"); }
-      if (action === "next" && wizard && collectWizardStep()) { wizard.step = Math.min(3, wizard.step + 1); renderWizard(); }
-      if (action === "back" && wizard) { if (collectWizardStep()) { wizard.step = Math.max(0, wizard.step - 1); renderWizard(); } }
+      if (action === "next" && wizard && collectWizardStep()) { wizard.error = ""; wizard.step = Math.min(3, wizard.step + 1); renderWizard(); }
+      if (action === "back" && wizard) { if (collectWizardStep()) { wizard.error = ""; wizard.step = Math.max(0, wizard.step - 1); renderWizard(); } }
       if (action === "finish") await finishWizard();
       return;
     }
@@ -484,16 +574,27 @@
     const action = actionButton.dataset.action;
     const row = actionButton.closest("[data-task-index]");
     const index = row ? Number(row.dataset.taskIndex) : null;
-    if (action === "create") openWizard();
-    if (action === "edit" && Number.isInteger(index)) openWizard(index);
-    if (action === "delete" && Number.isInteger(index)) applyResponse(await invoke("delete_task", index));
+    if (action === "create" && !taskWritePending) openWizard();
+    if (action === "edit" && Number.isInteger(index) && !taskWritePending) openWizard(index);
+    if (action === "delete" && Number.isInteger(index)) {
+      if (taskWritePending) return;
+      taskWritePending = true;
+      renderTasks();
+      try {
+        const response = await invoke("delete_task", index, state.tasks_revision);
+        applyResponse(response);
+      } finally {
+        taskWritePending = false;
+        renderTasks();
+      }
+    }
     if (action === "help") openHelp(false);
     if (action === "tray-menu") { trayMenu.classList.toggle("is-hidden"); actionButton.setAttribute("aria-expanded", String(!trayMenu.classList.contains("is-hidden"))); }
     if (action === "refresh") applyResponse(await invoke("refresh_music"), "音乐列表已刷新");
     if (action === "play") applyResponse(await invoke("play_track", actionButton.dataset.track));
     if (action === "stop") applyResponse(await invoke("stop_playback"));
     if (action === "minimize") applyResponse(await invoke("minimize"));
-    if (action === "close") applyResponse(await invoke("hide"));
+    if (action === "close") applyResponse(await invoke("close"));
     if (action === "show-window") { trayMenu.classList.add("is-hidden"); applyResponse(await invoke("show")); }
     if (action === "exit") { trayMenu.classList.add("is-hidden"); applyResponse(await invoke("exit")); }
   });
@@ -505,13 +606,26 @@
       if (response?.ok === false) event.target.checked = !event.target.checked;
     }
     if (event.target.matches("[data-task-switch]")) {
+      if (taskWritePending) {
+        event.target.checked = !event.target.checked;
+        return;
+      }
       const row = event.target.closest("[data-task-index]");
       if (!row) return;
-      const response = await invoke("set_task_enabled", Number(row.dataset.taskIndex), event.target.checked);
-      applyResponse(response);
-      if (response?.ok === false) event.target.checked = !event.target.checked;
+      taskWritePending = true;
+      renderTasks();
+      try {
+        const response = await invoke("set_task_enabled", Number(row.dataset.taskIndex), event.target.checked, state.tasks_revision);
+        applyResponse(response);
+        if (response?.ok === false) event.target.checked = !event.target.checked;
+      } finally {
+        taskWritePending = false;
+        renderTasks();
+      }
     }
     if (wizard && event.target.name === "play-mode") {
+      saveWizardTimeInputs();
+      wizard.error = "";
       wizard.data.mode = event.target.value;
       renderWizard();
     }
