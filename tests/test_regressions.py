@@ -10,10 +10,10 @@ import threading
 import time
 import unittest
 import wave
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from player_core import (
@@ -283,8 +283,9 @@ class ControllerRegressionTests(unittest.TestCase):
             controller.shutdown()
 
 
-class _FakeEvent:
+class _FakeEvent(threading.Event):
     def __init__(self):
+        super().__init__()
         self.handlers = []
 
     def __iadd__(self, handler):
@@ -297,7 +298,7 @@ class _FakeWindow:
         self.events = type(
             "Events",
             (),
-            {"loaded": _FakeEvent(), "closing": _FakeEvent()},
+            {"loaded": _FakeEvent(), "closing": _FakeEvent(), "shown": _FakeEvent()},
         )()
 
 
@@ -322,6 +323,7 @@ class WebAppLifecycleRegressionTests(unittest.TestCase):
         shell.silent = False
         shell._native_action_queue = queue.Queue()
         shell._native_stop_event = threading.Event()
+        shell.window = _FakeWindow()
         shell._tray_icon = None
         shell._tray_thread = None
         shell._native_dispatcher_thread = None
@@ -554,7 +556,7 @@ class RevisionControlRegressionTests(unittest.TestCase):
 
 
 class ClockRollbackAndWatermarkRegressionTests(unittest.TestCase):
-    def test_watermark_prevents_duplicate_trigger_across_clock_rollback(self):
+    def test_consumption_ledger_prevents_duplicate_trigger_across_clock_rollback(self):
         invocations = []
         task1 = valid_task("morning", "12:00:00", [0])
         task2 = valid_task("noon", "12:00:02", [0])
@@ -567,28 +569,165 @@ class ClockRollbackAndWatermarkRegressionTests(unittest.TestCase):
         service.tick(datetime(2026, 8, 24, 11, 59, 59, 500000))
         self.assertEqual([], invocations)
 
-        # 2. Tick at 12:00:01 triggers morning
+        # 2. Tick at 12:00:01 triggers morning and records the consumed schedule
         service.tick(datetime(2026, 8, 24, 12, 0, 1, 500000))
         self.assertEqual(1, len(invocations))
         self.assertEqual("morning", invocations[0][0])
         self.assertEqual(datetime(2026, 8, 24, 12, 0, 0), invocations[0][2])
+        self.assertTrue(service.is_consumed(0, datetime(2026, 8, 24, 12, 0, 0)))
 
-        # 3. System clock rolls back to 11:59:59
+        # 3. System clock rolls back to 11:59:59: only the baseline resets
         service.tick(datetime(2026, 8, 24, 11, 59, 59, 0))
         self.assertEqual(1, len(invocations))
         self.assertEqual(datetime(2026, 8, 24, 11, 59, 59), service.last_tick_dt)
-        self.assertEqual(datetime(2026, 8, 24, 12, 0, 1, 500000), service.evaluated_max_dt)
 
-        # 4. Clock reaches 12:00:01 again - MUST NOT re-trigger because candidate <= watermark
+        # 4. Clock reaches 12:00:01 again: the ledger blocks the replay
         service.tick(datetime(2026, 8, 24, 12, 0, 1, 500000))
         self.assertEqual(1, len(invocations))
 
-        # 5. Clock advances past watermark to 12:00:02.5 - noon triggers normally!
+        # 5. Clock advances to 12:00:02.5: noon is not consumed, so it triggers
         service.tick(datetime(2026, 8, 24, 12, 0, 2, 500000))
         self.assertEqual(2, len(invocations))
         self.assertEqual("noon", invocations[1][0])
         self.assertEqual(datetime(2026, 8, 24, 12, 0, 2), invocations[1][2])
-        self.assertEqual(datetime(2026, 8, 24, 12, 0, 2, 500000), service.evaluated_max_dt)
+
+
+class ConsumptionLedgerIdentityRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _spy_playback(controller):
+        recorded = []
+
+        def start_playlist(task, started_at=None, **_kwargs):
+            recorded.append((task.get("name"), started_at))
+            return {"ok": True, "event": "playing", "message": ""}
+
+        controller.playback.start_playlist = start_playlist
+        return recorded
+
+    def test_task_created_after_rollback_still_triggers(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            recorded = self._spy_playback(controller)
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 0,
+            })["ok"])
+
+            # A triggers at 13:00 on Monday 2026-08-24 and is recorded consumed.
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(["A"], [name for name, _ in recorded])
+
+            # Clock rolls back to 12:00 and a brand new task is created for 12:05.
+            controller.scheduler.tick(datetime(2026, 8, 24, 12, 0, 0))
+            self.assertTrue(controller.save_task({
+                "time": "12:05", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "B", "expected_revision": 1,
+            })["ok"])
+
+            # The new task fires; the old high-watermark no longer masks it.
+            controller.scheduler.tick(datetime(2026, 8, 24, 12, 5, 0, 500000))
+            self.assertEqual(["A", "B"], [name for name, _ in recorded])
+
+            # Re-crossing A's already consumed 13:00 does not replay it.
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(["A", "B"], [name for name, _ in recorded])
+            controller.shutdown()
+
+    def test_edit_and_disable_enable_keep_the_consumed_schedule(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            recorded = self._spy_playback(controller)
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 0,
+            })["ok"])
+            identity = controller.task_ids[0]
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(["A"], [name for name, _ in recorded])
+
+            # Rename keeps identity, so the consumed 13:00 schedule is retained.
+            self.assertTrue(controller.save_task({
+                "index": 0, "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A renamed", "expected_revision": 1,
+            })["ok"])
+            self.assertEqual(identity, controller.task_ids[0])
+            # Disable then re-enable also keeps identity.
+            self.assertTrue(controller.set_task_enabled(0, False, expected_revision=2)["ok"])
+            self.assertTrue(controller.set_task_enabled(0, True, expected_revision=3)["ok"])
+            self.assertEqual(identity, controller.task_ids[0])
+
+            controller.scheduler.tick(datetime(2026, 8, 24, 11, 0, 0))  # rollback
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(["A"], [name for name, _ in recorded])
+            controller.shutdown()
+
+    def test_moving_to_a_new_time_triggers_and_back_to_consumed_does_not(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            recorded = self._spy_playback(controller)
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 0,
+            })["ok"])
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(1, len(recorded))
+
+            # Move A to an unconsumed 14:00 -> triggers again.
+            self.assertTrue(controller.save_task({
+                "index": 0, "time": "14:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 1,
+            })["ok"])
+            controller.scheduler.tick(datetime(2026, 8, 24, 14, 0, 0, 500000))
+            self.assertEqual(2, len(recorded))
+
+            # Move A back to the already consumed 13:00 -> no replay.
+            self.assertTrue(controller.save_task({
+                "index": 0, "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 2,
+            })["ok"])
+            controller.scheduler.tick(datetime(2026, 8, 24, 11, 0, 0))  # rollback
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(2, len(recorded))
+            controller.shutdown()
+
+    def test_identical_tasks_have_distinct_identities_and_recreate_is_new(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            recorded = self._spy_playback(controller)
+            for _ in range(2):
+                self.assertTrue(controller.save_task({
+                    "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                    "weekdays": [0], "name": "twin", "expected_revision": controller.tasks_revision,
+                })["ok"])
+            self.assertEqual(2, len(controller.task_ids))
+            self.assertNotEqual(controller.task_ids[0], controller.task_ids[1])
+
+            # Delete then recreate an identical task: it is treated as new and
+            # can still trigger even at a previously consumed time.
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(1, len(recorded))  # single playback engine, one fires
+            self.assertTrue(controller.delete_task(0, expected_revision=controller.tasks_revision)["ok"])
+            self.assertTrue(controller.delete_task(0, expected_revision=controller.tasks_revision)["ok"])
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "fresh", "expected_revision": controller.tasks_revision,
+            })["ok"])
+            controller.scheduler.tick(datetime(2026, 8, 24, 11, 0, 0))  # rollback
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual(["twin", "fresh"], [name for name, _ in recorded])
+            controller.shutdown()
 
 
 class MidnightCatchupAndScheduledAtRegressionTests(unittest.TestCase):
@@ -1001,6 +1140,7 @@ class WebAppLifecycleAndHangPreventionRegressionTests(unittest.TestCase):
         shell._tray_unavailable = True
         shell._tray_icon = None
         shell._native_stop_event = threading.Event()
+        shell.window.events.shown.set()
         shutdown_called = []
         shell.shutdown = lambda: shutdown_called.append(True)
         shell._hide_window = lambda: self.fail("_hide_window should not be called")
@@ -1018,6 +1158,7 @@ class WebAppLifecycleAndHangPreventionRegressionTests(unittest.TestCase):
         shell2._tray_unavailable = False
         shell2._tray_icon = object()  # non-None tray icon
         shell2._native_stop_event = threading.Event()
+        shell2.window.events.shown.set()
         hidden_called = []
         shell2._hide_window = lambda: hidden_called.append(True)
         shell2.shutdown = lambda: self.fail("shutdown should not be called")
@@ -1035,6 +1176,7 @@ class WebAppLifecycleAndHangPreventionRegressionTests(unittest.TestCase):
         shell._tray_unavailable = False
         shell._tray_icon = object()
         shell._native_stop_event = threading.Event()
+        shell.window.events.shown.set()
         shutdown_called = []
         shell.shutdown = lambda: shutdown_called.append(True)
         shell._hide_window = lambda: self.fail("_hide_window should not be called when tray fails")
@@ -1112,6 +1254,254 @@ class WebAppLifecycleFailureInjectionRegressionTests(unittest.TestCase):
             with patch.object(MusicPlayerController, "_read_startup_status", side_effect=RuntimeError("reg fail")):
                 with self.assertRaises(RuntimeError):
                     MusicPlayerController(root, initialize_audio=False)
+
+
+class SchedulerDeleteRaceRegressionTests(unittest.TestCase):
+    def test_delete_before_tick_prevents_playback(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            recorded = []
+            controller.playback.start_playlist = (
+                lambda task, started_at=None, **_k: recorded.append(task.get("name"))
+                or {"ok": True, "event": "playing", "message": ""}
+            )
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 0,
+            })["ok"])
+            self.assertTrue(controller.delete_task(0, expected_revision=1)["ok"])
+            controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000))
+            self.assertEqual([], recorded)
+            controller.shutdown()
+
+    def test_delete_cannot_interleave_scheduler_critical_section(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+            controller = MusicPlayerController(root, initialize_audio=False)
+            self.assertTrue(controller.save_task({
+                "time": "13:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0], "name": "A", "expected_revision": 0,
+            })["ok"])
+
+            snapshot_taken = threading.Event()
+            release_snapshot = threading.Event()
+            recorded = []
+            original_provider = controller.scheduler.tasks_provider
+
+            def blocking_snapshot():
+                tasks = original_provider()
+                snapshot_taken.set()
+                if not release_snapshot.wait(2.0):
+                    raise TimeoutError("snapshot was not released")
+                return tasks
+
+            controller.scheduler.tasks_provider = blocking_snapshot
+            controller.playback.start_playlist = (
+                lambda task, started_at=None, **_k: recorded.append(task.get("name"))
+                or {"ok": True, "event": "playing", "message": ""}
+            )
+
+            tick_thread = threading.Thread(
+                target=lambda: controller.scheduler.tick(datetime(2026, 8, 24, 13, 0, 0, 500000)),
+                daemon=True,
+            )
+            delete_started = threading.Event()
+            delete_done = threading.Event()
+            delete_result: dict = {}
+
+            def do_delete():
+                delete_started.set()
+                delete_result["res"] = controller.delete_task(0, expected_revision=1)
+                delete_done.set()
+
+            delete_thread = threading.Thread(target=do_delete, daemon=True)
+            try:
+                tick_thread.start()
+                self.assertTrue(snapshot_taken.wait(2.0), "scheduler never took the snapshot")
+                delete_thread.start()
+                self.assertTrue(delete_started.wait(2.0))
+                # The provider has released its own lock; only the tick's shared
+                # lock can prevent deleting this snapshot before playback.
+                self.assertFalse(delete_done.wait(0.3))
+            finally:
+                release_snapshot.set()
+                tick_thread.join(2.0)
+                if delete_thread.ident is not None:
+                    delete_thread.join(2.0)
+                if not tick_thread.is_alive() and not delete_thread.is_alive():
+                    controller.shutdown()
+
+            self.assertFalse(tick_thread.is_alive())
+            self.assertFalse(delete_thread.is_alive())
+            self.assertEqual(["A"], recorded)
+            self.assertTrue(delete_done.is_set())
+            self.assertTrue(delete_result["res"]["ok"])
+
+
+class NextRunPreviewConsistencyRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _controller_with_two_same_time_tasks(root):
+        (root / "mp3").mkdir()
+        (root / "mp3" / "ok.mp3").write_bytes(b"audio")
+        controller = MusicPlayerController(root, initialize_audio=False)
+        for name in ("A", "B"):
+            controller.save_task({
+                "time": "12:00", "mode": "song", "files": ["mp3/ok.mp3"],
+                "weekdays": [0, 1, 2, 3, 4, 5, 6], "name": name,
+                "expected_revision": controller.tasks_revision,
+            })
+        return controller
+
+    def test_preview_names_the_task_the_scheduler_will_play(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            controller = self._controller_with_two_same_time_tasks(root)
+            recorded = []
+            controller.playback.start_playlist = (
+                lambda task, started_at=None, **_k: recorded.append(task.get("name"))
+                or {"ok": True, "event": "playing", "message": ""}
+            )
+            # Preview before 12:00 must name the tie-break winner (highest index).
+            info = controller._get_next_run_info(datetime(2026, 8, 24, 10, 0, 0))
+            self.assertEqual("B", info["name"])
+            # The scheduler plays that same task on the tie.
+            controller.scheduler.tick(datetime(2026, 8, 24, 12, 0, 0, 500000))
+            self.assertEqual(["B"], recorded)
+            controller.shutdown()
+
+    def test_preview_falls_back_when_the_tie_winner_is_disabled(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            controller = self._controller_with_two_same_time_tasks(root)
+            self.assertTrue(controller.set_task_enabled(1, False, expected_revision=controller.tasks_revision)["ok"])
+            info = controller._get_next_run_info(datetime(2026, 8, 24, 10, 0, 0))
+            self.assertEqual("A", info["name"])
+            controller.shutdown()
+
+    def test_preview_skips_consumed_schedule_after_rollback(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            controller = self._controller_with_two_same_time_tasks(root)
+            controller.playback.start_playlist = (
+                lambda task, started_at=None, **_k: {"ok": True, "event": "playing", "message": ""}
+            )
+            # Fire the 12:00 slot (both tasks marked consumed), then roll back.
+            controller.scheduler.tick(datetime(2026, 8, 24, 12, 0, 0, 500000))
+            controller.scheduler.tick(datetime(2026, 8, 24, 11, 0, 0))
+            info = controller._get_next_run_info(datetime(2026, 8, 24, 11, 59, 0))
+            # Today's 12:00 is consumed for both, so the preview points at the
+            # next day rather than a schedule that will not run again.
+            self.assertEqual("明天", info["date_label"])
+            controller.shutdown()
+
+    def test_preview_skips_more_than_a_year_of_consumed_schedules(self):
+        with temporary_workspace() as temp:
+            controller = self._controller_with_two_same_time_tasks(Path(temp))
+            self.addCleanup(controller.shutdown)
+            controller.playback.start_playlist = Mock(return_value={"ok": True})
+            first = datetime(2025, 1, 1, 12)
+            for offset in range(370):
+                controller.scheduler.tick(first + timedelta(days=offset))
+            rollback = first - timedelta(hours=1)
+            controller.scheduler.tick(rollback)
+
+            next_run = controller._next_unconsumed_run(
+                controller.tasks[1], controller.task_ids[1], rollback
+            )
+            self.assertEqual(first + timedelta(days=370), next_run)
+            self.assertEqual("B", controller._get_next_run_info(rollback)["name"])
+
+    def test_preview_stops_at_the_last_representable_date(self):
+        with temporary_workspace() as temp:
+            controller = self._controller_with_two_same_time_tasks(Path(temp))
+            self.addCleanup(controller.shutdown)
+            self.assertIsNone(controller._get_next_run_info(datetime.max))
+
+
+class WebAppStartupExitRegressionTests(unittest.TestCase):
+    def test_exit_waits_for_shown_but_does_not_require_loaded(self):
+        for silent in (False, True):
+            with self.subTest(silent=silent):
+                shell = WebAppLifecycleRegressionTests.make_shell()
+                shell.silent = silent
+                shell.controller = Mock()
+                window = shell.window
+                destroyed = threading.Event()
+                window.destroy = Mock(side_effect=destroyed.set)
+                shell._tray_exit()
+                shell._start_native_dispatcher()
+                dispatcher = shell._native_dispatcher_thread
+                try:
+                    self.assertFalse(destroyed.wait(0.1))
+                    self.assertIs(window, shell.window)
+                    window.events.shown.set()
+                    self.assertTrue(destroyed.wait(1.0), "exit still depends on loaded")
+                    self.assertFalse(window.events.loaded.is_set())
+                    self.assertIsNone(shell.window)
+                    shell.controller.shutdown.assert_called_once()
+                finally:
+                    shell._native_stop_event.set()
+                    dispatcher.join(2.0)
+                self.assertFalse(dispatcher.is_alive())
+
+    def test_dispatcher_waits_for_window_ready_before_acting(self):
+        shell = WebAppLifecycleRegressionTests.make_shell()
+        shown = threading.Event()
+        shell._show_window = shown.set
+        shell._native_action_queue.put("show")
+
+        t = threading.Thread(target=shell._dispatch_native_actions, daemon=True)
+        t.start()
+        try:
+            # The window is not ready, so the queued show must not run yet.
+            self.assertFalse(shown.wait(0.15))
+            # Once ready, the pending action runs.
+            shell.window.events.shown.set()
+            self.assertTrue(shown.wait(1.0))
+        finally:
+            shell._native_stop_event.set()
+            t.join(1.0)
+        self.assertFalse(t.is_alive())
+
+    def test_on_loaded_queues_show(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            app = WebApp(root, silent=False)
+            app._on_loaded()
+            self.assertEqual("show", app._native_action_queue.get_nowait())
+            app.shutdown()
+
+    def test_on_loaded_does_not_queue_show_when_closing(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            app = WebApp(root, silent=False)
+            app._closing = True
+            app._on_loaded()
+            self.assertTrue(app._native_action_queue.empty())
+            app.shutdown()
+
+    def test_run_skips_webview_start_when_closing_during_startup(self):
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            app = WebApp(root, silent=True)
+
+            def close_during_startup():
+                # Simulate a real exit dispatched while the app is still
+                # starting: shutdown runs before webview.start is reached.
+                app.shutdown()
+
+            with patch("web_app.webview") as fake_webview:
+                with patch.object(app, "create_window", return_value=None):
+                    with patch.object(app, "_start_native_dispatcher"):
+                        with patch.object(app, "setup_tray", side_effect=close_during_startup):
+                            app.run()
+                self.assertFalse(fake_webview.start.called)
+            self.assertFalse(app.controller.running)
 
 
 if __name__ == "__main__":

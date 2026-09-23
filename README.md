@@ -71,7 +71,9 @@ music.spec        PyInstaller 配置
 tests/            不依赖 GUI 的回归测试
 ```
 
-调度器每 500ms 检查一次，支持最多 90 秒的延迟补触发；已触发时间点不会重复执行，系统时钟回拨会重置基线而不补播。播放失败时会跳过坏曲目，固定时长结束后停止，所有操作都经过可重复的退出清理。
+调度器每 500ms 检查一次，支持最多 90 秒的延迟补触发。每个任务拥有仅在本次运行内有效的运行期标识，已触发的“任务＋计划时刻”会记入消费记录，因此系统时钟回拨只重置基线、不会重播已执行的计划；回拨后新建或改到新时刻的任务仍可正常触发，改回已消费的时刻则不重播。消费记录不写入 `tasks.json`，程序重启后清空。播放失败时会跳过坏曲目，固定时长结束后停止，所有操作都经过可重复的退出清理。
+
+播放预告会继续查找未消费的计划，不限制为未来一年。启动期间的窗口操作等待原生窗口就绪，不依赖网页加载成功，因此网页加载异常不会阻塞托盘退出。
 
 ## 验证
 
@@ -79,6 +81,8 @@ tests/            不依赖 GUI 的回归测试
 D:\Python\python.exe -c "import sys; print(sys.executable)"
 D:\Python\python.exe -m py_compile music.py player_core.py web_app.py
 D:\Python\python.exe -m unittest discover -s tests -v
+node --check ui/app.js
+node tests/test_ui.js
 D:\Python\python.exe -m PyInstaller music.spec
 ```
 

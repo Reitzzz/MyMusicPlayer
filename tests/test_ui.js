@@ -202,11 +202,12 @@ const api = createMockApi(fileName);
     };
 
     const winListeners = {};
+    const intervals = [];
     const fakeWin = {
       document: fakeDoc,
       setTimeout(fn) { return 1; },
       clearTimeout() {},
-      setInterval(fn) { return 1; },
+      setInterval(fn) { intervals.push(fn); return intervals.length; },
       clearInterval() {},
       requestAnimationFrame(fn) { fn(); },
       addEventListener(evt, fn) { (winListeners[evt] = winListeners[evt] || []).push(fn); },
@@ -214,10 +215,14 @@ const api = createMockApi(fileName);
       pywebview: { api: {} }
     };
 
-    return { fakeWin, fakeDoc, elements, appEl, dialogEl, backdropEl, createBtnEl, createElement };
+    // The startup toggle and its authoritative render target must exist so the
+    // change handler and renderState can read/write the checkbox.
+    const startupSwitchEl = createElement("input", "startup-switch");
+
+    return { fakeWin, fakeDoc, elements, appEl, dialogEl, backdropEl, createBtnEl, createElement, intervals, startupSwitchEl };
   }
 
-  const { fakeWin, fakeDoc, elements, appEl, dialogEl, backdropEl, createBtnEl, createElement } = createDomEnvironment();
+  const { fakeWin, fakeDoc, elements, appEl, dialogEl, backdropEl, createBtnEl, createElement, intervals, startupSwitchEl } = createDomEnvironment();
 
   let bridgeCallbacks = {};
   fakeWin.pywebview.api = {
@@ -247,7 +252,14 @@ const api = createMockApi(fileName);
       if (bridgeCallbacks.set_task_enabled) return bridgeCallbacks.set_task_enabled(idx, en, rev);
       return { ok: true, state: { tasks_revision: rev + 1, tasks: [], music_files: [{ path: "mp3/a.mp3", name: "a.mp3", folder: "mp3" }] } };
     },
-    poll_events: async () => []
+    set_startup: async (enabled) => {
+      if (bridgeCallbacks.set_startup) return bridgeCallbacks.set_startup(enabled);
+      return { ok: true, state: { startup_enabled: enabled, tasks: [], tasks_revision: 0, music_files: [] } };
+    },
+    poll_events: async () => {
+      if (bridgeCallbacks.poll_events) return bridgeCallbacks.poll_events();
+      return [];
+    }
   };
 
   // Run app.js inside VM context
@@ -429,6 +441,58 @@ const api = createMockApi(fileName);
   await appEl.dispatchEvent({ type: "click", target: deleteBtn });
   assert.strictEqual(deletePendingChecked, true);
   assert.strictEqual(createBtnEl.disabled, false, "createButton must be re-enabled after delete completes");
+
+  // Test H: startup switch reflects authoritative state after a failure and
+  // is not double-inverted (issue 4).
+  startupSwitchEl.checked = true; // user turns autostart on
+  bridgeCallbacks.set_startup = async () => ({
+    ok: false,
+    error: "设置开机自启失败",
+    state: { startup_enabled: false, tasks: [], tasks_revision: 8, music_files: [] },
+  });
+  await appEl.dispatchEvent({ type: "change", target: startupSwitchEl });
+  assert.strictEqual(startupSwitchEl.checked, false, "Failed enable must settle to authoritative OFF, not re-inverted ON");
+
+  // Success path still updates the switch.
+  startupSwitchEl.checked = true;
+  bridgeCallbacks.set_startup = async () => ({
+    ok: true,
+    state: { startup_enabled: true, tasks: [], tasks_revision: 8, music_files: [] },
+  });
+  await appEl.dispatchEvent({ type: "change", target: startupSwitchEl });
+  assert.strictEqual(startupSwitchEl.checked, true, "Successful enable keeps the switch ON");
+
+  // Bridge exception (no authoritative state) reverts to last known ON.
+  startupSwitchEl.checked = false; // user attempts to turn off
+  bridgeCallbacks.set_startup = async () => { throw new Error("bridge down"); };
+  await appEl.dispatchEvent({ type: "change", target: startupSwitchEl });
+  assert.strictEqual(startupSwitchEl.checked, true, "State-less failure restores last known value (ON)");
+  bridgeCallbacks.set_startup = null;
+
+  // Test I: a background error must not destroy an open wizard draft (issue 5).
+  await appEl.dispatchEvent({ type: "click", target: createBtnEl }); // open wizard
+  assert.strictEqual(backdropEl.classList.contains("is-hidden"), false, "Wizard should be open");
+  elements["start-time"].value = "07:15";
+  const backToDuration = createElement("input");
+  backToDuration.name = "play-mode";
+  backToDuration.value = "duration";
+  await appEl.dispatchEvent({ type: "change", target: backToDuration }); // persists 07:15 into draft
+  assert(dialogEl.innerHTML.includes('value="07:15"'), "Draft start time 07:15 rendered");
+
+  const pollBridgeEvents = intervals[1];
+  assert.strictEqual(typeof pollBridgeEvents, "function", "pollBridgeEvents interval should be captured");
+  bridgeCallbacks.poll_events = async () => [
+    { type: "error", title: "系统托盘不可用", message: "托盘线程已停止" },
+  ];
+  await pollBridgeEvents();
+
+  assert.strictEqual(backdropEl.classList.contains("is-hidden"), false, "Wizard must stay open after background error");
+  assert(dialogEl.innerHTML.includes('value="07:15"'), "Wizard draft must be preserved after background error");
+  assert(dialogEl.innerHTML.includes("时间与模式"), "Wizard must remain on its current step");
+  assert(!dialogEl.innerHTML.includes("知道了"), "Background error must not replace the wizard with the error dialog");
+  assert.strictEqual(elements["toast"].dataset.tone, "danger", "Background error is surfaced as a danger toast");
+  assert(elements["toast"].innerHTML.includes("托盘线程已停止"), "Toast shows the background error message");
+  bridgeCallbacks.poll_events = null;
 
   console.log("All UI regression tests passed!");
 })();

@@ -123,6 +123,12 @@
   }
 
   function showError(title, message, detail = "") {
+    // A background error must not destroy an in-progress wizard draft; surface
+    // it as a toast and leave the wizard DOM, step, focus and inputs intact.
+    if (wizard) {
+      showToast(message || title || "操作失败", "danger");
+      return;
+    }
     lastDialogFocus = document.activeElement;
     dialogKind = "error";
     wizard = null;
@@ -602,8 +608,15 @@
   app.addEventListener("change", async (event) => {
     if (event.target.id === "startup-switch") {
       const response = await invoke("set_startup", event.target.checked);
+      const authoritative = responseState(response);
       applyResponse(response);
-      if (response?.ok === false) event.target.checked = !event.target.checked;
+      // With authoritative state, applyResponse already rendered the correct
+      // switch position. Only a state-less failure (bridge exception) needs a
+      // manual revert, and it restores the last known value rather than
+      // blindly inverting the DOM.
+      if (!authoritative && response?.ok === false) {
+        event.target.checked = Boolean(state.startup_enabled);
+      }
     }
     if (event.target.matches("[data-task-switch]")) {
       if (taskWritePending) {

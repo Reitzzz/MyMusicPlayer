@@ -188,6 +188,15 @@ class WebApp:
                 action = self._native_action_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            window = self.window
+            if window is None:
+                return
+            # Native actions need shown, not a successfully loaded web page.
+            while not window.events.shown.is_set():
+                if self._native_stop_event.wait(0.05):
+                    return
+            if self._native_stop_event.is_set():
+                return
             if action == "minimize":
                 self._minimize_window()
             elif action == "hide":
@@ -290,11 +299,10 @@ class WebApp:
         return self.window
 
     def _on_loaded(self) -> None:
-        # JS fetches authoritative state itself.  The event is useful for
-        # browser harnesses and keeps the bridge free of UI writes.
+        # JS fetches authoritative state itself; native actions stay queued.
         self.enqueue_event({"type": "loaded"})
         if not self.silent:
-            self._show_window()
+            self.enqueue_native_action("show")
 
     @staticmethod
     def _tray_image() -> Any:
@@ -442,9 +450,12 @@ class WebApp:
             self._start_native_dispatcher()
             self.setup_tray()
             self.controller.start()
-            # Explicit EdgeChromium selects WebView2 on Windows and yields a
-            # clear exception when the runtime is missing.
-            webview.start(gui="edgechromium", debug=False)
+            with self._lock:
+                closing = self._closing
+            if not closing:
+                # Explicit EdgeChromium selects WebView2 on Windows and yields a
+                # clear exception when the runtime is missing.
+                webview.start(gui="edgechromium", debug=False)
         finally:
             self.shutdown()
         return 0

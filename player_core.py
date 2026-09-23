@@ -624,7 +624,15 @@ class PlaybackEngine:
 
 
 class SchedulerService:
-    """90-second-grace scheduler with rollback-safe monotonic baselines."""
+    """90-second-grace scheduler with an identity-based consumption ledger.
+
+    Duplicate triggers across a clock rollback are prevented by recording every
+    fired schedule as ``(runtime_identity, scheduled_datetime)`` rather than a
+    global time high-watermark, so tasks created after a rollback are not
+    masked by schedules that already ran.  ``identity_of`` maps a task to its
+    caller-owned runtime identity; the default uses the list index, which is
+    stable for the standalone scheduler tests.
+    """
 
     def __init__(
         self,
@@ -634,6 +642,8 @@ class SchedulerService:
         *,
         interval: float = 0.5,
         grace_seconds: int = SCHEDULE_GRACE_SECONDS,
+        lock: threading.RLock | None = None,
+        identity_of: Callable[[Mapping[str, Any], int], Any] | None = None,
     ) -> None:
         self.tasks_provider = tasks_provider
         self.on_due = on_due
@@ -641,11 +651,14 @@ class SchedulerService:
         self.interval = interval
         self.grace_seconds = grace_seconds
         self.last_tick_dt: datetime | None = None
-        self.evaluated_max_dt: datetime | None = None
         self.running = False
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._lock = threading.RLock()
+        # Share the controller's lock so snapshot, consumption and playback
+        # happen in one critical section, ordering ticks against task edits.
+        self._lock = lock if lock is not None else threading.RLock()
+        self._identity_of = identity_of if identity_of is not None else (lambda task, index: index)
+        self._consumed: set[tuple[Any, datetime]] = set()
 
     @staticmethod
     def _candidate_datetime(task: Mapping[str, Any], date_value: Any) -> datetime | None:
@@ -670,7 +683,9 @@ class SchedulerService:
             current = now or datetime.now()
             previous = self.last_tick_dt
             if previous is not None and current < previous:
-                # A rollback must reset the baseline without lowering evaluated_max_dt.
+                # A rollback only resets the baseline; the consumption ledger,
+                # not a time watermark, keeps already-fired schedules from
+                # replaying, so newly created tasks stay eligible.
                 self.last_tick_dt = current
                 if self.on_tick is not None:
                     self.on_tick(current)
@@ -681,12 +696,10 @@ class SchedulerService:
             else:
                 interval_start = previous
 
-            high_watermark = self.evaluated_max_dt if self.evaluated_max_dt is not None else interval_start
-            effective_start = max(interval_start, high_watermark)
             grace_start = current - timedelta(seconds=self.grace_seconds)
-            scan_start = max(effective_start, grace_start)
+            scan_start = max(interval_start, grace_start)
             tasks = list(self.tasks_provider())
-            due_candidates: list[tuple[datetime, int, Mapping[str, Any]]] = []
+            due_candidates: list[tuple[datetime, int, Mapping[str, Any], Any]] = []
             candidate_date = scan_start.date()
             while candidate_date <= current.date():
                 for task_index, task in enumerate(tasks):
@@ -695,22 +708,42 @@ class SchedulerService:
                     candidate = self._candidate_datetime(task, candidate_date)
                     if candidate is None:
                         continue
-                    if effective_start < candidate <= current and candidate >= grace_start:
-                        due_candidates.append((candidate, task_index, task))
+                    if interval_start < candidate <= current and candidate >= grace_start:
+                        identity = self._identity_of(task, task_index)
+                        due_candidates.append((candidate, task_index, task, identity))
                 candidate_date += timedelta(days=1)
 
-            # Advance the baseline and evaluated max before invoking potentially failing playback.
+            # Advance the baseline before invoking potentially failing playback.
             self.last_tick_dt = current
-            if self.evaluated_max_dt is None or current > self.evaluated_max_dt:
-                self.evaluated_max_dt = current
 
+            fresh = [
+                item for item in due_candidates
+                if (item[3], item[0]) not in self._consumed
+            ]
             selected: Mapping[str, Any] | None = None
-            if due_candidates:
-                candidate_dt, selected_index, selected = max(due_candidates, key=lambda item: (item[0], item[1]))
+            if fresh:
+                candidate_dt, selected_index, selected, _ = max(
+                    fresh, key=lambda item: (item[0], item[1])
+                )
+                # Record the winner and every conflict-loser in this window as
+                # consumed before playback, so a later rollback replays none of
+                # them and a playback failure is not retried.
+                for cand_dt, _idx, _task, ident in due_candidates:
+                    self._consumed.add((ident, cand_dt))
                 self.on_due(selected, selected_index, candidate_dt)
             if self.on_tick is not None:
                 self.on_tick(current)
             return selected
+
+    def is_consumed(self, identity: Any, scheduled_at: datetime) -> bool:
+        with self._lock:
+            return (identity, scheduled_at) in self._consumed
+
+    def forget_consumed(self, identity: Any) -> None:
+        """Drop a deleted task's ledger entries to bound in-process memory."""
+
+        with self._lock:
+            self._consumed = {key for key in self._consumed if key[0] != identity}
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -765,6 +798,8 @@ class MusicPlayerController:
         self.running = True
         self._closing = False
         self.tasks_revision = 0
+        self._task_id_seq = 0
+        self.task_ids: list[int] = []
         self.music_files: list[dict[str, str]] = []
         self.status_message = "就绪"
         self.status_tone = "neutral"
@@ -778,6 +813,7 @@ class MusicPlayerController:
             self.store = TaskStore(self.application_dir)
             self.tasks = self.store.load()
             self.tasks.sort(key=lambda task: task.get("time", "") if isinstance(task, dict) else "")
+            self.task_ids = [self._next_identity() for _ in self.tasks]
             self.store.tasks = _deepcopy_tasks(self.tasks)
             self.playback = PlaybackEngine(
                 self.application_dir,
@@ -787,6 +823,8 @@ class MusicPlayerController:
                 self._get_tasks,
                 self._on_due_task,
                 self._on_scheduler_tick,
+                lock=self._lock,
+                identity_of=self._identity_for,
             )
             self.refresh_music(emit=False)
             self._startup_enabled = self._read_startup_status()
@@ -828,6 +866,29 @@ class MusicPlayerController:
     def _get_tasks(self) -> list[Mapping[str, Any]]:
         with self._lock:
             return _deepcopy_tasks(self.tasks)
+
+    def _next_identity(self) -> int:
+        """Return a monotonically increasing, never-reused runtime identity."""
+
+        self._task_id_seq += 1
+        return self._task_id_seq
+
+    def _identity_for(self, task: Mapping[str, Any], index: int) -> Any:
+        # Called by the scheduler under the shared lock, so ``index`` still
+        # aligns with ``task_ids`` from the same tick's snapshot.
+        if 0 <= index < len(self.task_ids):
+            return self.task_ids[index]
+        return ("orphan", index)
+
+    def _sort_tasks_with_ids(self) -> None:
+        """Stable-sort tasks by start time, keeping identities aligned."""
+
+        order = sorted(
+            range(len(self.tasks)),
+            key=lambda i: self.tasks[i].get("time", "") if isinstance(self.tasks[i], dict) else "",
+        )
+        self.tasks = [self.tasks[i] for i in order]
+        self.task_ids = [self.task_ids[i] for i in order]
 
     def _emit(self, event_type: str = "state", **payload: Any) -> None:
         if self.event_sink is None:
@@ -1057,13 +1118,16 @@ class MusicPlayerController:
                 self._set_status(error or "任务数据无效", "danger")
                 return {"ok": False, "error": error or "任务数据无效", "state": self.get_state()}
             previous = _deepcopy_tasks(self.tasks)
+            previous_ids = list(self.task_ids)
             if index is None:
                 self.tasks.append(normalized)
+                self.task_ids.append(self._next_identity())
             else:
                 self.tasks[index] = normalized
-            self.tasks.sort(key=lambda task: task.get("time", ""))
+            self._sort_tasks_with_ids()
             if not self.store.save(self.tasks):
                 self.tasks = previous
+                self.task_ids = previous_ids
                 self.store.tasks = _deepcopy_tasks(previous)
                 self._set_status("任务设置未能保存，请检查程序目录的写入权限或磁盘空间。", "danger")
                 return {"ok": False, "error": self.store.last_error or "保存失败", "state": self.get_state()}
@@ -1087,13 +1151,18 @@ class MusicPlayerController:
             if index is None or index < 0 or index >= len(self.tasks):
                 return {"ok": False, "error": "任务索引无效", "state": self.get_state()}
             previous = _deepcopy_tasks(self.tasks)
+            previous_ids = list(self.task_ids)
             deleted = self.tasks.pop(index)
+            deleted_id = self.task_ids.pop(index)
             if not self.store.save(self.tasks):
                 self.tasks = previous
+                self.task_ids = previous_ids
                 self.store.tasks = _deepcopy_tasks(previous)
                 self._set_status("任务设置未能保存，请检查程序目录的写入权限或磁盘空间。", "danger")
                 return {"ok": False, "error": self.store.last_error or "保存失败", "state": self.get_state()}
             self.tasks_revision += 1
+            if self.scheduler is not None:
+                self.scheduler.forget_consumed(deleted_id)
             name = str(deleted.get("name", "未命名任务"))
             self._set_status(f"已删除任务：{name}", "success", toast=True)
             return {"ok": True, "deleted": copy.deepcopy(deleted), "state": self.get_state()}
@@ -1124,16 +1193,20 @@ class MusicPlayerController:
             return {"ok": True, "state": self.get_state()}
 
     def _get_next_run_info(self, now: datetime) -> dict[str, Any] | None:
-        candidates: list[tuple[datetime, Mapping[str, Any]]] = []
-        for task in self.tasks:
+        candidates: list[tuple[datetime, int, Mapping[str, Any]]] = []
+        for index, task in enumerate(self.tasks):
             if not task.get("enabled", True):
                 continue
-            next_run = self.get_next_run(task, now)
+            identity = self.task_ids[index] if index < len(self.task_ids) else None
+            next_run = self._next_unconsumed_run(task, identity, now)
             if next_run is not None:
-                candidates.append((next_run, task))
+                candidates.append((next_run, index, task))
         if not candidates:
             return None
-        next_run, task = min(candidates, key=lambda item: item[0])
+        # Earliest time wins; ties resolve to the highest list index, matching
+        # the scheduler's conflict rule so the preview names the task that will
+        # actually play.
+        next_run, _, task = min(candidates, key=lambda item: (item[0], -item[1]))
         day_offset = (next_run.date() - now.date()).days
         if day_offset == 0:
             day_text = "今天"
@@ -1152,8 +1225,16 @@ class MusicPlayerController:
             "weekdays": list(task.get("weekdays", [])) if isinstance(task.get("weekdays"), list) else [],
         }
 
-    @staticmethod
-    def get_next_run(task: Mapping[str, Any], now: datetime) -> datetime | None:
+    def _next_unconsumed_run(
+        self, task: Mapping[str, Any], identity: Any, now: datetime
+    ) -> datetime | None:
+        """Next future occurrence that the scheduler has not already consumed.
+
+        Consumed future occurrences only exist after a clock rollback; skipping
+        them keeps the preview from advertising a schedule that will not fire,
+        while continuing across days finds the real next run.
+        """
+
         weekdays = {
             day for day in task.get("weekdays", [])
             if isinstance(day, int) and not isinstance(day, bool) and 0 <= day <= 6
@@ -1164,13 +1245,20 @@ class MusicPlayerController:
             task_time = datetime.strptime(str(task["time"]), "%H:%M:%S").time()
         except (KeyError, TypeError, ValueError):
             return None
-        for day_offset in range(8):
+        for day_offset in range((datetime.max.date() - now.date()).days + 1):
             candidate_date = now.date() + timedelta(days=day_offset)
             if candidate_date.weekday() not in weekdays:
                 continue
             candidate = datetime.combine(candidate_date, task_time)
-            if candidate > now:
-                return candidate
+            if candidate <= now:
+                continue
+            if (
+                identity is not None
+                and self.scheduler is not None
+                and self.scheduler.is_consumed(identity, candidate)
+            ):
+                continue
+            return candidate
         return None
 
     def play_track(self, path_value: Any) -> dict[str, Any]:
