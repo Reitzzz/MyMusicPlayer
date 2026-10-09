@@ -1,4 +1,4 @@
-﻿build/
+build/
 dist/
 __pycache__/
 *.pyc
@@ -10,3 +10,4 @@ __pycache__/
 tests/.tmp/*
 !tests/.tmp/.gitkeep
 tasks.corrupt-*.json
+.test-runtime-*/

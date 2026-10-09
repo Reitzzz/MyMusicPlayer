@@ -52,7 +52,7 @@ D:\Python\python.exe -m PyInstaller music.spec
 
 - `tasks.json`：任务列表，保持原有字段结构（`time`、`mode`、`end_time`、`end_next_day`、`files`、`name`、`weekdays`、`enabled`）。音频路径优先保存为相对于程序目录的便携路径。
 - `config.json`：首次运行标记等配置。
-- `mp3/`、`changyong/`：用户音频目录，程序不会删除、移动或重编码其中内容。
+- `mp3/`、`changyong/`：用户音频目录，程序不会删除、移动或重编码其中内容。目录不存在时会在刷新音乐列表时自动创建空目录。
 
 读取 `tasks.json` 时，如果发现 JSON 损坏或显式字段无效，程序会先生成唯一的 `tasks.corrupt-*.json` 备份，再加载可用任务；备份失败时进入只读保护。正常保存使用临时文件、刷新和原子替换，避免半写入文件。
 

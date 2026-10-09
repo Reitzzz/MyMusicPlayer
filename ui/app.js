@@ -15,6 +15,9 @@
     playing: "volume",
     neutral: "check-circle",
   };
+  // Backend clock events arrive every scheduler tick; a longer silence means
+  // the native side stalled, so the local ticker takes the display back.
+  const CLOCK_STALE_MS = 3000;
 
   let state = emptyState();
   let wizard = null;
@@ -22,6 +25,7 @@
   let toastTimer = 0;
   let helpTimer = 0;
   let helpSeconds = 0;
+  let lastBackendClockAt = 0;
   let dialogKind = null;
   let draggedSongIndex = null;
   let mockApi = null;
@@ -142,6 +146,15 @@
     focusDialog();
   }
 
+  function renderClock(value) {
+    // The backend clock is authoritative: it shares the source with the
+    // scheduler. The local Date fallback only fills gaps before the first
+    // successful state sync or after the backend clock goes stale.
+    if (!value) return;
+    lastBackendClockAt = Date.now();
+    document.getElementById("live-clock").textContent = value;
+  }
+
   function statusIcon(tone) {
     return icons[tone] || "check-circle";
   }
@@ -160,7 +173,7 @@
     state.status = { ...emptyState().status, ...(nextState?.status || {}) };
     state.store = { ...emptyState().store, ...(nextState?.store || {}) };
     app.classList.toggle("is-playing", Boolean(state.playback.active));
-    document.getElementById("live-clock").textContent = state.clock || "00:00:00";
+    renderClock(state.clock);
     renderNow();
     renderTasks();
     renderLibrary();
@@ -678,7 +691,7 @@
     if (!Array.isArray(events)) return;
     for (const event of events) {
       if (event.type === "state" && event.state) renderState(event.state);
-      if (event.type === "clock" && event.clock) document.getElementById("live-clock").textContent = event.clock;
+      if (event.type === "clock" && event.clock) renderClock(event.clock);
       if (event.type === "toast") showToast(event.message, event.tone || "neutral");
       if (event.type === "error") showError(event.title || "操作失败", event.message || "请重试", event.detail || "");
     }
@@ -689,7 +702,9 @@
   window.setInterval(syncState, 5000);
   window.setInterval(pollBridgeEvents, 500);
   window.setInterval(() => {
-    if (state.clock && state.clock !== "00:00:00") {
+    // Local ticking only covers the startup gap and a stalled backend clock;
+    // fresh backend clock events own the display.
+    if (Date.now() - lastBackendClockAt > CLOCK_STALE_MS) {
       const now = new Date();
       document.getElementById("live-clock").textContent = now.toLocaleTimeString("zh-CN", { hour12: false });
     }

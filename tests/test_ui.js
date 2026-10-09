@@ -494,5 +494,19 @@ const api = createMockApi(fileName);
   assert(elements["toast"].innerHTML.includes("托盘线程已停止"), "Toast shows the background error message");
   bridgeCallbacks.poll_events = null;
 
+  // Test J: the local ticker resumes once the backend clock goes stale.
+  const tickClock = intervals[2];
+  assert.strictEqual(typeof tickClock, "function", "Clock interval should be captured");
+  bridgeCallbacks.poll_events = async () => [{ type: "clock", clock: "88:88:88" }];
+  await pollBridgeEvents();
+  assert.strictEqual(elements["live-clock"].textContent, "88:88:88", "Backend clock event owns the display");
+  const realDateNow = Date.now;
+  Date.now = () => realDateNow() + 60000; // backend clock is now stale
+  tickClock();
+  Date.now = realDateNow;
+  assert.notStrictEqual(elements["live-clock"].textContent, "88:88:88", "Stale backend clock must fall back to local time");
+  assert(/^\d{2}:\d{2}:\d{2}$/.test(elements["live-clock"].textContent), "Local fallback must render HH:MM:SS");
+  bridgeCallbacks.poll_events = null;
+
   console.log("All UI regression tests passed!");
 })();

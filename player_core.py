@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import shutil
+import sys
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,9 @@ CONFIG_FILE = "config.json"
 MUSIC_DIRECTORIES = ("mp3", "changyong")
 ALLOWED_EXTENSIONS = (".mp3", ".wav", ".flac", ".ogg")
 SCHEDULE_GRACE_SECONDS = 90
+# Preview horizon for next run: 2 years. Covers the >1-year consumed-ledger
+# regression with margin while bounding the worst-case day scan.
+NEXT_RUN_PREVIEW_DAYS = 730
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_APP_NAME = "MusicSchedulerByStudent"
 
@@ -441,16 +445,17 @@ class PlaybackEngine:
         self._close_file()
 
     def _play_path(self, path_value: str | os.PathLike[str]) -> tuple[bool, str]:
+        file_label = Path(str(path_value)).name or "音频文件"
         try:
             path = self._resolve(path_value)
-        except Exception as exc:
-            return False, f"无效路径: {exc}"
+        except Exception:
+            return False, f"无效路径: {file_label}"
 
         if path.suffix.casefold() not in ALLOWED_EXTENSIONS:
             return False, f"不支持的音频格式: {path.suffix}"
 
         if not path.exists() or not path.is_file():
-            return False, "文件不存在"
+            return False, f"文件不存在: {file_label}"
         if not self._mixer_ready and not self.initialize():
             return False, self.audio_error or "音频设备不可用"
         try:
@@ -480,7 +485,9 @@ class PlaybackEngine:
                     pass
             self._current_file = None
             self.current_track_path = None
-            return False, str(exc)
+            # The raw decoder exception often embeds the absolute file path;
+            # only the file name and the exception type reach the user.
+            return False, f"无法播放 {file_label}（{type(exc).__name__}）"
 
     def play_manual(self, path_value: str) -> tuple[bool, str]:
         with self._lock:
@@ -659,6 +666,10 @@ class SchedulerService:
         self._lock = lock if lock is not None else threading.RLock()
         self._identity_of = identity_of if identity_of is not None else (lambda task, index: index)
         self._consumed: set[tuple[Any, datetime]] = set()
+        # Monotonic version of the consumption ledger. get_state caches the
+        # next-run preview per second and uses this to notice ledger changes
+        # (trigger/rollback/forget) that do not bump tasks_revision.
+        self._consumed_version = 0
 
     @staticmethod
     def _candidate_datetime(task: Mapping[str, Any], date_value: Any) -> datetime | None:
@@ -730,6 +741,7 @@ class SchedulerService:
                 # them and a playback failure is not retried.
                 for cand_dt, _idx, _task, ident in due_candidates:
                     self._consumed.add((ident, cand_dt))
+                self._consumed_version += 1
                 self.on_due(selected, selected_index, candidate_dt)
             if self.on_tick is not None:
                 self.on_tick(current)
@@ -743,7 +755,17 @@ class SchedulerService:
         """Drop a deleted task's ledger entries to bound in-process memory."""
 
         with self._lock:
-            self._consumed = {key for key in self._consumed if key[0] != identity}
+            remaining = {key for key in self._consumed if key[0] != identity}
+            if len(remaining) != len(self._consumed):
+                self._consumed = remaining
+                self._consumed_version += 1
+
+    @property
+    def consumed_version(self) -> int:
+        """Monotonic counter bumped on every consumption-ledger change."""
+
+        with self._lock:
+            return self._consumed_version
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -805,6 +827,12 @@ class MusicPlayerController:
         self.status_tone = "neutral"
         self._startup_enabled = False
         self.first_run_help = False
+        # One-second cache for the next-run preview: one write path emits
+        # state 2-3 times within the same tick, and rescanning every call is
+        # wasteful once the task list grows. Keyed on (second, revision,
+        # ledger version) so triggers, edits and deletes invalidate it.
+        self._next_run_cache: dict[str, Any] | None = None
+        self._next_run_cache_key: tuple[Any, ...] | None = None
         self.playback: PlaybackEngine | None = None
         self.scheduler: SchedulerService | None = None
         self.store: TaskStore | None = None
@@ -923,16 +951,23 @@ class MusicPlayerController:
             return False
 
     def get_startup_command(self) -> str:
-        if getattr(__import__("sys"), "frozen", False):
-            return f'"{__import__("sys").executable}" --silent'
-        import sys
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}" --silent'
 
         return f'"{sys.executable}" "{(self.application_dir / "music.py").resolve()}" --silent'
+
+    def _cached_next_run_info(self, now: datetime) -> dict[str, Any] | None:
+        ledger_version = self.scheduler.consumed_version if self.scheduler is not None else 0
+        key = (now.replace(microsecond=0), self.tasks_revision, ledger_version)
+        if key != self._next_run_cache_key:
+            self._next_run_cache = self._get_next_run_info(now)
+            self._next_run_cache_key = key
+        return copy.deepcopy(self._next_run_cache)
 
     def get_state(self) -> dict[str, Any]:
         with self._lock:
             now = datetime.now()
-            next_run = self._get_next_run_info(now)
+            next_run = self._cached_next_run_info(now)
             return {
                 "clock": now.strftime("%H:%M:%S"),
                 "tasks": _deepcopy_tasks(self.tasks),
@@ -1245,7 +1280,12 @@ class MusicPlayerController:
             task_time = datetime.strptime(str(task["time"]), "%H:%M:%S").time()
         except (KeyError, TypeError, ValueError):
             return None
-        for day_offset in range((datetime.max.date() - now.date()).days + 1):
+        # Bound the day scan by the preview horizon. The remaining-days clamp
+        # keeps datetime.max reachable without overflow, preserving the
+        # stop-at-last-representable-date behavior.
+        remaining_days = (datetime.max.date() - now.date()).days
+        horizon_days = min(remaining_days, NEXT_RUN_PREVIEW_DAYS)
+        for day_offset in range(horizon_days + 1):
             candidate_date = now.date() + timedelta(days=day_offset)
             if candidate_date.weekday() not in weekdays:
                 continue
