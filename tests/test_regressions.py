@@ -50,6 +50,53 @@ def valid_task(name: str = "task", clock: str = "12:00:00", weekdays=None) -> di
     }
 
 
+class _FakeDecodeError(Exception):
+    """Stand-in for a pygame decoder error whose text embeds a file path."""
+
+
+class _FakeMixerMusic:
+    def __init__(self, load_error: Exception | None = None) -> None:
+        self._load_error = load_error
+        self._busy = False
+
+    def set_volume(self, *_args) -> None:
+        pass
+
+    def get_busy(self) -> bool:
+        return self._busy
+
+    def unload(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._busy = False
+
+    def play(self) -> None:
+        self._busy = True
+
+    def load(self, _file_obj) -> None:
+        if self._load_error is not None:
+            raise self._load_error
+
+
+class _FakeMixer:
+    def __init__(self, load_error: Exception | None = None) -> None:
+        self.music = _FakeMixerMusic(load_error)
+
+    def init(self) -> None:
+        pass
+
+    def quit(self) -> None:
+        pass
+
+
+class _FakePygame:
+    """Minimal pygame surface so playback failures can be driven in tests."""
+
+    def __init__(self, load_error: Exception | None = None) -> None:
+        self.mixer = _FakeMixer(load_error)
+
+
 class TaskStoreRegressionTests(unittest.TestCase):
     def test_corrupt_source_is_backed_up_and_read_only_when_json_invalid(self):
         with temporary_workspace() as temp:
@@ -591,6 +638,34 @@ class ClockRollbackAndWatermarkRegressionTests(unittest.TestCase):
         self.assertEqual("noon", invocations[1][0])
         self.assertEqual(datetime(2026, 8, 24, 12, 0, 2), invocations[1][2])
 
+    def test_same_second_tasks_consume_whole_window_across_rollback(self):
+        # Two tasks share 12:00:00. The firing tick must consume *every* due
+        # candidate in the window (winner and tie-losers alike), not only the
+        # selected winner, so re-crossing that second after a rollback replays
+        # none of them.
+        invocations = []
+        task1 = valid_task("A", "12:00:00", [0])
+        task2 = valid_task("B", "12:00:00", [0])
+        service = SchedulerService(
+            lambda: [task1, task2],
+            lambda t, idx, scheduled_at: invocations.append((t["name"], scheduled_at)),
+        )
+
+        service.tick(datetime(2026, 8, 24, 11, 59, 59, 500000))
+        service.tick(datetime(2026, 8, 24, 12, 0, 0, 500000))
+        self.assertEqual(1, len(invocations))
+        due = datetime(2026, 8, 24, 12, 0, 0)
+        # Both identities are recorded, not just the tie-break winner.
+        self.assertTrue(service.is_consumed(0, due))
+        self.assertTrue(service.is_consumed(1, due))
+
+        # Roll back past the whole second, then step forward through 12:00:00
+        # twice at sub-second granularity: the ledger blocks every replay.
+        service.tick(datetime(2026, 8, 24, 11, 59, 58, 0))
+        service.tick(datetime(2026, 8, 24, 12, 0, 0, 200000))
+        service.tick(datetime(2026, 8, 24, 12, 0, 0, 800000))
+        self.assertEqual(1, len(invocations))
+
 
 class ConsumptionLedgerIdentityRegressionTests(unittest.TestCase):
     @staticmethod
@@ -1022,6 +1097,33 @@ class ManualPlaybackAndFileLockingRegressionTests(unittest.TestCase):
                 self.assertEqual([], engine.playlist_queue)
                 self.assertEqual("", engine.current_task_name)
 
+    def test_play_path_decode_failure_hides_absolute_path(self):
+        # A raw decoder exception often embeds the absolute file path; the
+        # user-facing message must carry only the file name and exception type.
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            (root / "mp3").mkdir()
+            audio = root / "mp3" / "a.wav"
+            audio.write_bytes(b"not real audio")
+            absolute = str(audio.resolve())
+            engine = PlaybackEngine(
+                root,
+                pygame_module=_FakePygame(_FakeDecodeError(f"cannot decode {absolute}")),
+                initialize_audio=True,
+            )
+
+            ok, msg = engine._play_path("mp3/a.wav")
+            self.assertFalse(ok)
+            self.assertIn("a.wav", msg)
+            self.assertIn("_FakeDecodeError", msg)
+            # Neither the absolute path nor its parent directory may leak.
+            self.assertNotIn(absolute, msg)
+            self.assertNotIn(str(root.resolve()), msg)
+            # The failed load is fully cleaned up.
+            self.assertIsNone(engine._current_file)
+            self.assertIsNone(engine.current_track_path)
+            engine.shutdown()
+
     def test_engine_rejects_unsupported_audio_format(self):
         with temporary_workspace() as temp:
             root = Path(temp)
@@ -1381,6 +1483,33 @@ class NextRunPreviewConsistencyRegressionTests(unittest.TestCase):
             self.assertTrue(controller.set_task_enabled(1, False, expected_revision=controller.tasks_revision)["ok"])
             info = controller._get_next_run_info(datetime(2026, 8, 24, 10, 0, 0))
             self.assertEqual("A", info["name"])
+            controller.shutdown()
+
+    def test_same_second_preview_cache_refreshes_when_ledger_changes(self):
+        # The next-run cache keys on (second, tasks_revision, consumed_version).
+        # A trigger bumps only consumed_version, so the same-second preview must
+        # still refresh off a stale cached entry.
+        with temporary_workspace() as temp:
+            root = Path(temp)
+            controller = self._controller_with_two_same_time_tasks(root)
+            controller.playback.start_playlist = (
+                lambda task, started_at=None, **_k: {"ok": True, "event": "playing", "message": ""}
+            )
+            preview_now = datetime(2026, 8, 24, 11, 59, 0)
+            first = controller._cached_next_run_info(preview_now)
+            self.assertEqual("今天", first["date_label"])
+
+            revision_before = controller.tasks_revision
+            version_before = controller.scheduler.consumed_version
+            # Consume today's 12:00 slot for both tasks via the scheduler.
+            controller.scheduler.tick(datetime(2026, 8, 24, 12, 0, 0, 500000))
+            self.assertEqual(revision_before, controller.tasks_revision)
+            self.assertGreater(controller.scheduler.consumed_version, version_before)
+
+            # Same wall-clock second, but the ledger moved: the preview rolls to
+            # tomorrow instead of serving the cached "today" entry.
+            second = controller._cached_next_run_info(preview_now)
+            self.assertEqual("明天", second["date_label"])
             controller.shutdown()
 
     def test_preview_skips_consumed_schedule_after_rollback(self):
